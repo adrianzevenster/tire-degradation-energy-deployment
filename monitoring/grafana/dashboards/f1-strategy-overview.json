@@ -1,0 +1,60 @@
+{
+  "title": "F1 Strategy Overview",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Inference p95 ms",
+      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
+      "targets": [{"expr": "f1_inference_latency_ms_p95"}]
+    },
+    {
+      "type": "stat",
+      "title": "Events Total",
+      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
+      "targets": [{"expr": "f1_throughput_events_total"}]
+    },
+    {
+      "type": "stat",
+      "title": "Drift Alerts",
+      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
+      "targets": [{"expr": "f1_drift_alerts_total"}]
+    },
+    {
+      "type": "stat",
+      "title": "Pit Recommendations",
+      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
+      "targets": [{"expr": "f1_pit_stop_recommendations_total"}]
+    },
+    {
+      "type": "timeseries",
+      "title": "Tire Risk",
+      "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "f1_tire_wear_pct", "legendFormat": "wear pct"},
+        {"expr": "f1_tire_cliff_probability * 100", "legendFormat": "cliff probability pct"},
+        {"expr": "f1_overheating_probability * 100", "legendFormat": "overheat probability pct"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Pace and ERS",
+      "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "f1_next_lap_delta_s", "legendFormat": "next lap delta"},
+        {"expr": "f1_ers_efficiency", "legendFormat": "ERS efficiency"},
+        {"expr": "f1_ers_ending_soc", "legendFormat": "ending SOC"}
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Drift Z Scores",
+      "gridPos": {"x": 0, "y": 12, "w": 24, "h": 8},
+      "targets": [
+        {"expr": "{__name__=~\"f1_drift_z_score_.*\"}"}
+      ]
+    }
+  ]
+}

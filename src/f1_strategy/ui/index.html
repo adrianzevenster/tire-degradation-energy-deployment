@@ -1,0 +1,391 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>F1 Strategy Ops</title>
+    <link rel="stylesheet" href="/ui/styles.css" />
+  </head>
+  <body>
+    <header class="topbar">
+      <div>
+        <h1>F1 Strategy Ops</h1>
+        <p id="serviceState">Connecting</p>
+      </div>
+      <div class="toolbar">
+        <label>
+          Laps
+          <input id="lapsInput" type="number" min="1" max="78" value="18" />
+        </label>
+        <label>
+          Seed
+          <input id="seedInput" type="number" min="1" max="9999" value="7" />
+        </label>
+        <label>
+          Batch
+          <input id="batchInput" type="number" min="1" max="12" value="1" />
+        </label>
+        <label>
+          Model
+          <select id="modelSelect">
+            <option value="auto">Auto</option>
+            <option value="hybrid">Hybrid</option>
+            <option value="kalman">Kalman</option>
+            <option value="xgboost">XGBoost</option>
+            <option value="lightgbm">LightGBM</option>
+            <option value="catboost">CatBoost</option>
+            <option value="sequence">Sequence</option>
+            <option value="river">River</option>
+          </select>
+        </label>
+        <label>
+          Artifact
+          <select id="artifactSelect">
+            <option value="">Unregistered</option>
+          </select>
+        </label>
+        <button id="startButton" title="Start live simulation">Start</button>
+        <button id="pauseButton" title="Pause live simulation">Pause</button>
+        <button id="tickButton" title="Advance one telemetry batch">Step</button>
+        <button id="resetButton" title="Reset current simulation state">Reset</button>
+      </div>
+    </header>
+
+    <main class="layout">
+      <section id="appNotice" class="notice" hidden></section>
+
+      <nav class="tabs" aria-label="Dashboard views">
+        <button id="liveTabButton" class="tab-button active" type="button">Live</button>
+        <button id="opsTabButton" class="tab-button" type="button">Operations</button>
+        <button id="historyTabButton" class="tab-button" type="button">Run History</button>
+      </nav>
+
+      <section id="liveTab" class="tab-view active">
+        <section class="status-grid" aria-label="Live status">
+          <article class="metric">
+            <span>Lap</span>
+            <strong id="lapValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>Tire Wear</span>
+            <strong id="wearValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>Cliff Risk</span>
+            <strong id="cliffValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>ERS</span>
+            <strong id="ersValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>Lap Delta</span>
+            <strong id="deltaValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>p95 Latency</span>
+            <strong id="latencyValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>Model</span>
+            <strong id="modelValue">-</strong>
+          </article>
+        </section>
+
+        <section class="chart-row">
+          <div class="panel tire-pressure-panel">
+            <div class="panel-head">
+              <h2>Tire Pressure Load</h2>
+              <span id="pressureState">Waiting</span>
+            </div>
+            <div class="tire-map">
+              <div id="tireFL" class="tire-cell front left">
+                <span>FL</span>
+                <strong>-</strong>
+                <small>-</small>
+              </div>
+              <div class="car-silhouette">
+                <span>Front</span>
+                <div></div>
+                <span>Rear</span>
+              </div>
+              <div id="tireFR" class="tire-cell front right">
+                <span>FR</span>
+                <strong>-</strong>
+                <small>-</small>
+              </div>
+              <div id="tireRL" class="tire-cell rear left">
+                <span>RL</span>
+                <strong>-</strong>
+                <small>-</small>
+              </div>
+              <div class="pressure-readout">
+                <div><span>Brake</span><strong id="pressureBrake">-</strong></div>
+                <div><span>Lateral G</span><strong id="pressureLateral">-</strong></div>
+                <div><span>Slip</span><strong id="pressureSlip">-</strong></div>
+              </div>
+              <div id="tireRR" class="tire-cell rear right">
+                <span>RR</span>
+                <strong>-</strong>
+                <small>-</small>
+              </div>
+            </div>
+          </div>
+          <div class="panel chart-panel">
+            <div class="panel-head">
+              <h2>Tire State</h2>
+              <span id="tireBand">Stable</span>
+            </div>
+            <canvas id="tireChart" width="900" height="280"></canvas>
+          </div>
+          <div class="panel chart-panel">
+            <div class="panel-head">
+              <h2>Pace And ERS</h2>
+              <span id="paceBand">Live</span>
+            </div>
+            <canvas id="paceChart" width="900" height="280"></canvas>
+          </div>
+        </section>
+
+        <section class="split">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Strategy</h2>
+              <span id="pitWindowValue">-</span>
+            </div>
+            <div class="strategy-grid">
+              <div>
+                <span>Target Pit</span>
+                <strong id="pitTarget">-</strong>
+              </div>
+              <div>
+                <span>Undercut</span>
+                <strong id="undercutValue">-</strong>
+              </div>
+              <div>
+                <span>Safety Car</span>
+                <strong id="safetyValue">-</strong>
+              </div>
+              <div>
+                <span>Pace Target</span>
+                <strong id="paceTarget">-</strong>
+              </div>
+            </div>
+            <div class="deployment" id="deploymentBars"></div>
+            <ul id="reasonList" class="reason-list"></ul>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Monitoring</h2>
+              <span id="eventCount">0 events</span>
+            </div>
+            <div class="monitor-grid">
+              <div>
+                <span>Throughput</span>
+                <strong id="throughputValue">-</strong>
+              </div>
+              <div>
+                <span>Interval</span>
+                <strong id="intervalValue">-</strong>
+              </div>
+              <div>
+                <span>Brake Temp</span>
+                <strong id="brakeValue">-</strong>
+              </div>
+              <div>
+                <span>Overheat</span>
+                <strong id="overheatValue">-</strong>
+              </div>
+            </div>
+            <table>
+              <thead>
+                <tr>
+                  <th>Drift Signal</th>
+                  <th>Z</th>
+                </tr>
+              </thead>
+              <tbody id="driftRows"></tbody>
+            </table>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Metric Stream</h2>
+            <span id="simulationProgress">0 / 0</span>
+          </div>
+          <div id="metricStream" class="metric-stream"></div>
+        </section>
+      </section>
+
+      <section id="opsTab" class="tab-view">
+        <section class="status-grid ops-status-grid" aria-label="Deployment readiness">
+          <article class="metric">
+            <span>Deployment</span>
+            <strong id="deploymentReadyValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>Health</span>
+            <strong id="healthScoreValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>Alerts</span>
+            <strong id="alertCountValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>Rollback</span>
+            <strong id="rollbackValue">-</strong>
+          </article>
+        </section>
+
+        <section class="split">
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Readiness Checks</h2>
+              <span id="readinessState">Waiting</span>
+            </div>
+            <div id="readinessChecks" class="check-list"></div>
+          </article>
+
+          <article class="panel">
+            <div class="panel-head">
+              <h2>Active Alerts</h2>
+              <span id="alertState">0 active</span>
+            </div>
+            <div id="alertList" class="alert-list"></div>
+          </article>
+        </section>
+
+        <section class="chart-row">
+          <div class="panel chart-panel">
+            <div class="panel-head">
+              <h2>Prometheus Model Metrics</h2>
+              <span id="modelMetricBand">Live</span>
+            </div>
+            <canvas id="modelMetricsChart" width="900" height="280"></canvas>
+          </div>
+          <div class="panel chart-panel">
+            <div class="panel-head">
+              <h2>Prometheus Service Metrics</h2>
+              <span id="serviceMetricBand">Live</span>
+            </div>
+            <canvas id="serviceMetricsChart" width="900" height="280"></canvas>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Model Comparison</h2>
+            <span id="comparisonState">No evaluated models</span>
+          </div>
+          <div class="comparison-grid">
+            <div>
+              <canvas id="comparisonChart" width="900" height="280"></canvas>
+            </div>
+            <div class="history-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Rank</th>
+                    <th>Model</th>
+                    <th>Artifact</th>
+                    <th>Eval</th>
+                    <th>MAE</th>
+                    <th>RMSE</th>
+                    <th>Coverage</th>
+                    <th>Health</th>
+                    <th>Alerts</th>
+                  </tr>
+                </thead>
+                <tbody id="comparisonRows">
+                  <tr><td colspan="9">No evaluated models</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <section id="historyTab" class="tab-view">
+        <section class="history-summary-grid" aria-label="Run history summary">
+          <article class="metric">
+            <span>Saved Runs</span>
+            <strong id="historyRunCount">0</strong>
+          </article>
+          <article class="metric">
+            <span>Best Avg Delta</span>
+            <strong id="historyBestDelta">-</strong>
+          </article>
+          <article class="metric">
+            <span>Worst Cliff</span>
+            <strong id="historyWorstCliff">-</strong>
+          </article>
+          <article class="metric">
+            <span>Avg Latency</span>
+            <strong id="historyAvgLatency">-</strong>
+          </article>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Run History</h2>
+            <div class="panel-actions">
+              <span id="historyState">No durable history</span>
+              <label>
+                Sort
+                <select id="historySortSelect">
+                  <option value="updated_at_ms">Recent</option>
+                  <option value="avg_lap_delta_s">Avg Delta</option>
+                  <option value="max_tire_wear_pct">Wear</option>
+                  <option value="max_cliff_probability">Cliff</option>
+                  <option value="avg_latency_ms">Latency</option>
+                </select>
+              </label>
+              <button id="historySortDirectionButton" title="Toggle sort direction">Desc</button>
+              <button id="historyRefreshButton" title="Refresh saved simulation runs">Refresh</button>
+            </div>
+          </div>
+          <div class="history-grid">
+            <div>
+              <canvas id="historyChart" width="900" height="260"></canvas>
+            </div>
+            <div class="history-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Run</th>
+                    <th>Samples</th>
+                    <th>Lap</th>
+                    <th>Max Wear</th>
+                    <th>Max Cliff</th>
+                    <th>Max Overheat</th>
+                    <th>Avg Delta</th>
+                    <th>Delta Range</th>
+                    <th>Avg ERS</th>
+                    <th>Interval</th>
+                    <th>Latency</th>
+                    <th>Pit</th>
+                  </tr>
+                </thead>
+                <tbody id="historyRows">
+                  <tr><td colspan="12">No saved runs</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Selected Run</h2>
+            <span id="selectedRunTitle">Click a run</span>
+          </div>
+          <div id="selectedRunDetails" class="detail-grid"></div>
+        </section>
+      </section>
+    </main>
+
+    <script src="/ui/app.js" defer></script>
+  </body>
+</html>

@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local configuration
+.env
+.env.local
+
+# IDE/editor state
+.codex
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Runtime/generated artifacts
+catboost_info/
+reports/
+models/
+artifacts/
+data/
+*.duckdb
+*.sqlite
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db

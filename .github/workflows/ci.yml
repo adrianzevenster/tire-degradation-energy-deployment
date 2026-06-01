@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+      - master
+
+jobs:
+  quality-gates:
+    name: Python quality gates
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version:
+          - "3.11"
+          - "3.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install package and test tooling
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[api,observability]"
+          python -m pip install build
+
+      - name: Compile source
+        run: python -m compileall -q src tests
+
+      - name: Run unit and system tests
+        run: python -m unittest discover -s tests
+
+      - name: Run model regression gates
+        run: python -m f1_strategy.regression
+
+      - name: Verify CLI startup
+        run: |
+          python -m f1_strategy.cli --version
+          python -m f1_strategy.cli --laps 1
+
+      - name: Build package
+        run: python -m build
+
+  docker-gate:
+    name: Docker build gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Build API image
+        run: |
+          docker build \
+            --build-arg F1_BUILD_SHA="${GITHUB_SHA}" \
+            --build-arg F1_BUILD_DATE="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            -t f1-tire-energy-strategy:${GITHUB_SHA} .
+
+  xgboost-gate:
+    name: Optional tree model serving gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ML dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[ml]"
+
+      - name: Train XGBoost artifact
+        run: python -m f1_strategy.training --backend xgboost --seeds 8 --laps 8 --rounds 24 --output models/xgboost_lap_delta.json
+
+      - name: Verify XGBoost serving backend
+        env:
+          F1_MODEL_BACKEND: xgboost
+          F1_XGBOOST_MODEL_PATH: models/xgboost_lap_delta.json
+        run: |
+          python -m f1_strategy.cli --laps 2
+          python -m f1_strategy.regression
+          python - <<'PY'
+          from f1_strategy.engine import InferenceEngine
+
+          engine = InferenceEngine()
+          assert getattr(engine.model, "backend_name", None) == "xgboost"
+          print(type(engine.model).__name__)
+          PY
+
+      - name: Train LightGBM artifact
+        run: python -m f1_strategy.training --backend lightgbm --seeds 8 --laps 8 --rounds 24 --output models/lightgbm_lap_delta.txt
+
+      - name: Verify LightGBM serving backend
+        env:
+          F1_MODEL_BACKEND: lightgbm
+          F1_LIGHTGBM_MODEL_PATH: models/lightgbm_lap_delta.txt
+        run: |
+          python -m f1_strategy.cli --laps 2
+          python -m f1_strategy.regression
+
+  kalman-gate:
+    name: Kalman serving gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Verify Kalman backend
+        env:
+          F1_MODEL_BACKEND: kalman
+        run: |
+          python -m f1_strategy.cli --laps 2
+          python -m f1_strategy.regression
+
+  extended-model-gate:
+    name: Extended optional model gates
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install extended model dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[catboost,online,deep]"
+
+      - name: Train CatBoost artifact
+        run: python -m f1_strategy.training --backend catboost --seeds 8 --laps 8 --rounds 24 --output models/catboost_lap_delta.cbm
+
+      - name: Verify CatBoost serving backend
+        env:
+          F1_MODEL_BACKEND: catboost
+          F1_CATBOOST_MODEL_PATH: models/catboost_lap_delta.cbm
+        run: python -m f1_strategy.regression
+
+      - name: Verify River online backend
+        env:
+          F1_MODEL_BACKEND: river
+        run: python -m f1_strategy.regression
+
+      - name: Train Torch sequence artifact
+        run: python -m f1_strategy.training --backend sequence --seeds 8 --laps 8 --rounds 24 --output models/sequence_lap_delta.pt
+
+      - name: Verify LSTM/TFT TorchScript backend
+        env:
+          F1_MODEL_BACKEND: tft
+          F1_SEQUENCE_MODEL_PATH: models/sequence_lap_delta.pt
+        run: python -m f1_strategy.regression

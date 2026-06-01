@@ -1,0 +1,47 @@
+[project]
+name = "f1-tire-energy-strategy"
+version = "0.1.0"
+description = "Production-oriented real-time tire degradation, energy deployment, and strategy optimization system."
+requires-python = ">=3.11"
+dependencies = []
+
+[project.optional-dependencies]
+api = ["fastapi>=0.110", "uvicorn>=0.27"]
+ml = ["numpy>=1.26", "scikit-learn>=1.4", "xgboost>=2.0", "lightgbm>=4.0"]
+catboost = ["catboost>=1.2"]
+deep = ["torch>=2.2"]
+online = ["river>=0.22"]
+all-models = [
+    "numpy>=1.26",
+    "scikit-learn>=1.4",
+    "xgboost>=2.0",
+    "lightgbm>=4.0",
+    "catboost>=1.2",
+    "river>=0.22",
+    "torch>=2.2",
+]
+observability = ["prometheus-client>=0.20"]
+persistence = ["duckdb>=1.0"]
+dev = ["pytest>=8.0", "ruff>=0.4"]
+
+[project.scripts]
+f1-simulate = "f1_strategy.cli:simulate_main"
+f1-regression = "f1_strategy.regression:main"
+f1-evaluate = "f1_strategy.evaluation:main"
+f1-train-model = "f1_strategy.training:main"
+f1-train-xgboost = "f1_strategy.training:main"
+f1-artifacts = "f1_strategy.artifacts:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+f1_strategy = ["ui/*.html", "ui/*.css", "ui/*.js"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"

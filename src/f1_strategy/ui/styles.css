@@ -198,7 +198,7 @@ button:active {
 }
 
 .ops-status-grid {
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(7, minmax(0, 1fr));
 }
 
 .metric,
@@ -259,6 +259,12 @@ button:active {
   color: var(--muted);
   font-size: 12px;
   font-weight: 680;
+}
+
+.replay-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: minmax(0, 1.3fr) minmax(260px, 0.7fr);
 }
 
 .panel-actions {
@@ -494,7 +500,8 @@ th {
 }
 
 .history-grid,
-.comparison-grid {
+.comparison-grid,
+.artifact-release-grid {
   display: grid;
   gap: 16px;
   grid-template-columns: minmax(320px, 0.8fr) minmax(520px, 1.2fr);
@@ -530,10 +537,39 @@ th {
   background: #19313a;
 }
 
+#artifactRows tr {
+  cursor: pointer;
+}
+
+#artifactRows tr:hover {
+  background: #16212b;
+}
+
+#artifactRows tr.selected {
+  background: #19313a;
+}
+
 .detail-grid {
   display: grid;
   gap: 10px;
   grid-template-columns: repeat(6, minmax(0, 1fr));
+}
+
+.artifact-detail-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  margin-bottom: 12px;
+}
+
+.artifact-blockers {
+  margin-top: 12px;
+}
+
+.artifact-suite-wrap {
+  margin-top: 12px;
+}
+
+.replay-suite-wrap {
+  margin-top: 14px;
 }
 
 .detail-item {
@@ -563,6 +599,10 @@ th {
 .alert-list {
   display: grid;
   gap: 9px;
+}
+
+.check-list.compact {
+  gap: 8px;
 }
 
 .check-item,
@@ -627,6 +667,8 @@ th {
   .history-summary-grid,
   .chart-row,
   .split,
+  .replay-grid,
+  .artifact-release-grid,
   .history-grid {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
@@ -657,6 +699,8 @@ th {
   .split,
   .history-grid,
   .comparison-grid,
+  .artifact-release-grid,
+  .replay-grid,
   .strategy-grid,
   .monitor-grid,
   .metric-stream,

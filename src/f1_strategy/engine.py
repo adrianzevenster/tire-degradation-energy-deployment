@@ -4,7 +4,7 @@ from dataclasses import replace
 from time import perf_counter
 
 from f1_strategy.config import Settings, load_settings
-from f1_strategy.deployment import deployment_readiness
+from f1_strategy.deployment import deployment_readiness, latest_promoted_artifact, load_registry
 from f1_strategy.domain import DriftReport, Prediction, StrategyRecommendation, TelemetryEvent
 from f1_strategy.drift import DriftDetector
 from f1_strategy.feature_store import OnlineFeatureStore
@@ -26,7 +26,7 @@ class InferenceEngine:
         persistence: PersistenceStore | None = None,
         settings: Settings | None = None,
     ) -> None:
-        self.settings = settings or load_settings()
+        self.settings = self._resolve_startup_settings(settings or load_settings(), model)
         config = ModelConfig(
             target_latency_ms=self.settings.target_latency_ms,
             base_lap_time_s=self.settings.base_lap_time_s,
@@ -54,6 +54,18 @@ class InferenceEngine:
         )
         self.latency_ms: list[float] = []
         self.build_info = build_info()
+
+    @staticmethod
+    def _resolve_startup_settings(settings: Settings, model: ServingModel | None) -> Settings:
+        if model is not None or settings.model_artifact_id.strip():
+            return settings
+        backend = settings.model_backend.strip().lower()
+        if backend not in {"auto", ""}:
+            return settings
+        promoted = latest_promoted_artifact(load_registry(settings.model_artifact_root))
+        if promoted is None:
+            return settings
+        return replace(settings, model_backend="auto", model_artifact_id=promoted["artifact_id"])
 
     def ingest(self, event: TelemetryEvent) -> Prediction:
         start = perf_counter()

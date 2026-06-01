@@ -112,6 +112,23 @@ def rollback_candidate(
     return artifacts[0] if artifacts else None
 
 
+def latest_promoted_artifact(
+    registry: dict[str, Any],
+    backend: str | None = None,
+) -> dict[str, Any] | None:
+    promoted_ids = set(registry.get("promoted", {}).values())
+    artifacts = [
+        artifact
+        for artifact in registry.get("artifacts", [])
+        if artifact.get("status") == "promoted"
+        and artifact.get("artifact_id") in promoted_ids
+        and artifact.get("feature_schema_hash") == feature_schema_hash()
+        and (backend is None or artifact.get("backend") == backend)
+    ]
+    artifacts.sort(key=lambda item: str(item.get("created_at", "")), reverse=True)
+    return artifacts[0] if artifacts else None
+
+
 def load_registry(artifact_root: str | Path) -> dict[str, Any]:
     path = Path(artifact_root) / "registry.json"
     if not path.exists():

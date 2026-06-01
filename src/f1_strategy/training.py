@@ -7,15 +7,19 @@ from pathlib import Path
 from f1_strategy.artifacts import DEFAULT_ARTIFACT_ROOT, create_model_artifact_bundle
 from f1_strategy.config import load_settings
 from f1_strategy.domain import TireCompound
+from f1_strategy.engine import InferenceEngine
 from f1_strategy.evaluation import run_evaluation
 from f1_strategy.feature_store import OnlineFeatureStore
 from f1_strategy.models import (
     FEATURE_NAMES,
+    ModelConfig,
+    create_serving_model,
     feature_schema_hash,
     features_to_vector,
     model_manifest_path,
     write_model_manifest,
 )
+from f1_strategy.replay import DEFAULT_REPLAY_DATASET, run_replay_evaluation, run_replay_suite
 from f1_strategy.simulation import RaceSimulator, SimulationConfig
 
 
@@ -34,6 +38,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--artifact-root",
         default=None,
         help="Optional artifact registry root for a train/evaluate bundle.",
+    )
+    parser.add_argument(
+        "--replay-dataset",
+        default=str(DEFAULT_REPLAY_DATASET),
+        help="Replay telemetry dataset used as the holdout promotion gate.",
     )
     return parser
 
@@ -255,11 +264,22 @@ def main() -> None:
             model_backend=args.backend,
             model_paths={args.backend: str(output_path), "sequence": str(output_path)},
         )
+        replay_report = run_replay_evaluation(
+            args.replay_dataset,
+            engine=InferenceEngine(model=_serving_model_for_artifact(args.backend, output_path)),
+        )
+        replay_suite = run_replay_suite(
+            engine_factory=lambda: InferenceEngine(
+                model=_serving_model_for_artifact(args.backend, output_path)
+            )
+        )
         bundle = create_model_artifact_bundle(
             model_path=output_path,
             backend=args.backend,
             training_config=training_config,
             evaluation_report=report,
+            replay_evaluation_report=replay_report,
+            replay_suite_report=replay_suite,
             artifact_root=args.artifact_root or DEFAULT_ARTIFACT_ROOT,
         )
         print(f"bundled artifact: {bundle.artifact_id}")
@@ -287,6 +307,18 @@ def _training_config(
         "training_rows": training_rows,
         "feature_schema_hash": feature_schema_hash(),
     }
+
+
+def _serving_model_for_artifact(backend: str, output_path: Path):
+    output = str(output_path)
+    return create_serving_model(
+        config=ModelConfig(),
+        backend=backend,
+        xgboost_model_path=output if backend == "xgboost" else "models/xgboost_lap_delta.json",
+        lightgbm_model_path=output if backend == "lightgbm" else "models/lightgbm_lap_delta.txt",
+        catboost_model_path=output if backend == "catboost" else "models/catboost_lap_delta.cbm",
+        sequence_model_path=output if backend == "sequence" else "models/sequence_lap_delta.pt",
+    )
 
 
 if __name__ == "__main__":

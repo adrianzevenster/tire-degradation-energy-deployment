@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from f1_strategy.artifacts import artifact_release_detail
 from f1_strategy.config import load_settings
 from f1_strategy.deployment import load_registry
 from f1_strategy.engine import InferenceEngine
@@ -9,6 +10,13 @@ from f1_strategy.live import LiveSimulationManager
 from f1_strategy.metadata import APP_VERSION, build_info
 from f1_strategy.models import FEATURE_SCHEMA_VERSION, feature_schema_hash
 from f1_strategy.monitoring import monitoring_catalog
+from f1_strategy.replay import (
+    DEFAULT_REPLAY_DATASET,
+    replay_report_to_dict,
+    replay_suite_to_dict,
+    run_replay_evaluation,
+    run_replay_suite,
+)
 from f1_strategy.serialization import telemetry_from_dict, to_jsonable
 
 engine = InferenceEngine()
@@ -131,6 +139,16 @@ try:
             "promoted": registry.get("promoted", {}),
             "artifacts": registry.get("artifacts", []),
         }
+
+    @app.get("/artifacts/{artifact_id:path}")
+    def artifact_detail(artifact_id: str) -> dict:
+        try:
+            return artifact_release_detail(
+                artifact_id=artifact_id,
+                artifact_root=engine.settings.model_artifact_root,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
 
     @app.post("/model/backend")
     def model_backend(backend: str) -> dict[str, str]:
@@ -295,6 +313,22 @@ try:
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return {"status": "recorded"}
+
+    @app.get("/evaluation/replay")
+    def replay_evaluation() -> dict:
+        try:
+            report = run_replay_evaluation(DEFAULT_REPLAY_DATASET)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return replay_report_to_dict(report)
+
+    @app.get("/evaluation/replay-suite")
+    def replay_suite() -> dict:
+        try:
+            report = run_replay_suite()
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return replay_suite_to_dict(report)
 
     @app.get("/prediction/{session_id}/{car_id}")
     def prediction(session_id: str, car_id: str) -> dict:

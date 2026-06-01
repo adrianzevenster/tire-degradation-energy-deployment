@@ -18,6 +18,7 @@ The first implementation is dependency-light and runnable with the Python standa
 python -m f1_strategy.cli --laps 8
 python -m f1_strategy.cli --version
 python -m f1_strategy.evaluation --format markdown
+python -m f1_strategy.replay --dataset examples/replay_telemetry.csv
 python -m unittest discover -s tests
 ```
 
@@ -28,6 +29,7 @@ pip install -e .
 f1-simulate --laps 12
 f1-regression
 f1-evaluate --format json --output reports/model-evaluation.json
+f1-replay-evaluate --dataset examples/replay_telemetry.csv
 ```
 
 Common workflows are also available through `make`:
@@ -35,10 +37,13 @@ Common workflows are also available through `make`:
 ```bash
 make test
 make regression
+make replay-evaluate
 make reports
 make ci
 make train MODEL_BACKEND=xgboost MODEL_OUTPUT=models/xgboost_lap_delta.json
 make train-evaluate MODEL_BACKEND=xgboost MODEL_OUTPUT=models/xgboost_lap_delta.json
+make register-local-artifacts
+make prune-artifacts
 make promote-artifact ARTIFACT_ID=xgboost/2026-05-31T120102Z-abc1234
 ```
 
@@ -114,17 +119,39 @@ the resulting artifact, and writes an immutable local bundle under
 - `training_config.json`
 - `evaluation.json`
 - `evaluation.md`
+- `replay_evaluation.json`
 
 The bundle manifest records artifact ID, git SHA, training parameters, feature schema
-hash, simulated data fingerprint, and summary evaluation metrics. The local
-`artifacts/models/registry.json` index tracks candidate artifacts and promoted
-artifacts. Generated artifacts stay out of Git by default.
+hash, simulated data fingerprint, replay dataset fingerprint, simulator evaluation
+metrics, and replay holdout metrics. The local `artifacts/models/registry.json`
+index tracks candidate artifacts and promoted artifacts. Generated artifacts stay
+out of Git by default.
 
 Promotion is a separate gate-checked step. `make promote-artifact ARTIFACT_ID=...`
 validates that the manifest is complete, the model file and evaluation report exist,
 the feature schema hash matches serving code, mean MAE and coverage satisfy thresholds,
-p95 latency is within budget, and monotonic tire-wear violations are zero. Successful
-promotion updates both the artifact manifest and `registry.json`.
+p95 latency is within budget, monotonic tire-wear violations are zero, and replay
+holdout gates pass. Successful promotion updates both the artifact manifest and
+`registry.json`.
+
+If model files already exist under `models/` but are not in the artifact registry,
+register them as versioned candidates with:
+
+```bash
+make register-local-artifacts
+```
+
+This scans the default XGBoost, LightGBM, CatBoost, and sequence model paths, runs
+simulator and replay evaluation for each available file, writes immutable bundles
+under `artifacts/models`, and updates `artifacts/models/registry.json`.
+
+When `F1_MODEL_BACKEND=auto` and `F1_MODEL_ARTIFACT_ID` is unset, the service loads
+the latest promoted artifact from the registry on startup. Archive older candidate
+entries with:
+
+```bash
+make prune-artifacts
+```
 
 Serve a registered bundle by artifact ID:
 
@@ -193,6 +220,22 @@ average prediction interval width, p95 serving latency, and monotonic tire-wear
 violations. Reports also include the active feature schema version and hash. This
 complements the CI regression suite by producing a portable model quality artifact
 for reviews, releases, and model comparisons.
+
+Replay evaluation is the production-facing complement to simulator regression. A
+replay dataset can be CSV or JSONL with the same telemetry fields accepted by
+`POST /telemetry`: `session_id`, `car_id`, `lap`, `sector`, speed/control signals,
+tire/brake temperatures, ERS/fuel/weather fields, `compound`, and optional
+`timestamp_ms`. Include `lap_time_s` for every holdout row when the dataset should
+act as a promotion gate. Run:
+
+```bash
+python -m f1_strategy.replay --dataset examples/replay_telemetry.csv
+```
+
+The replay report records the dataset fingerprint, session/event counts, labeled
+row count, target completeness, MAE/RMSE, coverage, p95 latency, monotonic wear
+violations, and pass/fail gates. The API exposes the same report at
+`GET /evaluation/replay`.
 
 ## API Service
 

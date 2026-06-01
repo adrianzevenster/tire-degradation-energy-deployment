@@ -237,6 +237,18 @@
             <span>Rollback</span>
             <strong id="rollbackValue">-</strong>
           </article>
+          <article class="metric">
+            <span>Replay Gate</span>
+            <strong id="replayGateValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>Active Artifact</span>
+            <strong id="activeArtifactValue">-</strong>
+          </article>
+          <article class="metric">
+            <span>Promoted Artifact</span>
+            <strong id="promotedArtifactValue">-</strong>
+          </article>
         </section>
 
         <section class="split">
@@ -271,6 +283,88 @@
               <span id="serviceMetricBand">Live</span>
             </div>
             <canvas id="serviceMetricsChart" width="900" height="280"></canvas>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Replay Holdout</h2>
+            <span id="replayState">Waiting</span>
+          </div>
+          <div class="replay-grid">
+            <div class="detail-grid" id="replaySummary"></div>
+            <div>
+              <div id="replayGates" class="check-list compact"></div>
+            </div>
+          </div>
+          <div class="history-table-wrap replay-suite-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>Split</th>
+                  <th>Status</th>
+                  <th>MAE</th>
+                  <th>Coverage</th>
+                  <th>Cal Error</th>
+                  <th>Width</th>
+                  <th>Pit Error</th>
+                  <th>Regret</th>
+                </tr>
+              </thead>
+              <tbody id="replaySuiteRows">
+                <tr><td colspan="8">No replay suite</td></tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Artifact Release</h2>
+            <span id="artifactReleaseState">No artifacts</span>
+          </div>
+          <div class="artifact-release-grid">
+            <div class="history-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Artifact</th>
+                    <th>Status</th>
+                    <th>Replay</th>
+                    <th>Replay MAE</th>
+                    <th>Replay Coverage</th>
+                    <th>Dataset</th>
+                  </tr>
+                </thead>
+                <tbody id="artifactRows">
+                  <tr><td colspan="6">No registered artifacts</td></tr>
+                </tbody>
+              </table>
+            </div>
+            <div>
+              <div id="artifactDetailGrid" class="detail-grid artifact-detail-grid"></div>
+              <div id="artifactBlockers" class="check-list compact artifact-blockers"></div>
+              <div class="history-table-wrap artifact-suite-wrap">
+                <table>
+                  <thead>
+                    <tr>
+                      <th>Split</th>
+                      <th>Status</th>
+                      <th>MAE</th>
+                      <th>Coverage</th>
+                      <th>Cal Error</th>
+                      <th>Width</th>
+                      <th>Pit Error</th>
+                      <th>Regret</th>
+                      <th>Dataset</th>
+                    </tr>
+                  </thead>
+                  <tbody id="artifactSuiteRows">
+                    <tr><td colspan="9">No replay suite</td></tr>
+                  </tbody>
+                </table>
+              </div>
+            </div>
           </div>
         </section>
 

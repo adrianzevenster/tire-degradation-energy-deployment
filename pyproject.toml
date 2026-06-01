@@ -28,6 +28,7 @@ dev = ["pytest>=8.0", "ruff>=0.4"]
 f1-simulate = "f1_strategy.cli:simulate_main"
 f1-regression = "f1_strategy.regression:main"
 f1-evaluate = "f1_strategy.evaluation:main"
+f1-replay-evaluate = "f1_strategy.replay:main"
 f1-train-model = "f1_strategy.training:main"
 f1-train-xgboost = "f1_strategy.training:main"
 f1-artifacts = "f1_strategy.artifacts:main"

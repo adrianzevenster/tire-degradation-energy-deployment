@@ -11,8 +11,10 @@ from f1_strategy.drift import DriftDetector
 from f1_strategy.engine import InferenceEngine
 from f1_strategy.artifacts import (
     PromotionGateConfig,
+    artifact_release_detail,
     create_model_artifact_bundle,
     promote_artifact,
+    prune_artifact_registry,
     resolve_model_artifact,
 )
 from f1_strategy.deployment import load_registry, rollback_candidate
@@ -41,8 +43,23 @@ from f1_strategy.models import (
     write_model_manifest,
 )
 from f1_strategy.monitoring import MonitoringService, monitoring_catalog
-from f1_strategy.persistence import DuckDBPersistence, NullPersistence, create_persistence_store
+from f1_strategy.persistence import (
+    DuckDBPersistence,
+    InMemoryPersistence,
+    NullPersistence,
+    create_persistence_store,
+)
 from f1_strategy.regression import RegressionSuite
+from f1_strategy.replay import (
+    REPLAY_REQUIRED_COLUMNS,
+    ReplayEvaluationReport,
+    ReplaySuiteReport,
+    load_replay_events,
+    replay_report_to_dict,
+    replay_suite_to_dict,
+    run_replay_evaluation,
+    run_replay_suite,
+)
 from f1_strategy.serialization import telemetry_from_dict, to_jsonable
 from f1_strategy.simulation import RaceSimulator, SimulationConfig
 from f1_strategy.training import train_xgboost_model
@@ -179,6 +196,32 @@ class SystemTest(unittest.TestCase):
         self.assertIn("mean_mae_lap_delta_s", payload)
         self.assertEqual(payload["feature_schema_hash"], feature_schema_hash())
 
+    def test_replay_evaluation_reports_holdout_gates(self) -> None:
+        events = load_replay_events("examples/replay_telemetry.csv")
+        self.assertGreater(len(events), 0)
+        self.assertTrue(all(getattr(events[0], name) is not None for name in REPLAY_REQUIRED_COLUMNS))
+
+        report = run_replay_evaluation("examples/replay_telemetry.csv")
+        payload = replay_report_to_dict(report)
+
+        self.assertEqual(report.event_count, len(events))
+        self.assertEqual(report.labeled_event_count, len(events))
+        self.assertEqual(report.missing_target_pct, 0.0)
+        self.assertEqual(payload["scenario"]["source"], "replay")
+        self.assertIn("dataset_fingerprint", payload)
+        self.assertTrue(all(isinstance(value, bool) for value in report.gates.values()))
+        self.assertTrue(report.passed, payload)
+
+    def test_replay_suite_reports_named_splits(self) -> None:
+        report = run_replay_suite()
+        payload = replay_suite_to_dict(report)
+
+        self.assertGreaterEqual(report.split_count, 5)
+        self.assertTrue(report.passed, payload)
+        self.assertIn("smoke", {split.scenario.scenario for split in report.splits})
+        self.assertGreater(report.total_event_count, 12)
+        self.assertTrue(all(split.dataset_fingerprint for split in report.splits))
+
     def test_model_manifest_validates_feature_schema_hash(self) -> None:
         with TemporaryDirectory() as temp_dir:
             artifact = Path(temp_dir) / "model.json"
@@ -211,6 +254,8 @@ class SystemTest(unittest.TestCase):
                     "training_rows": 18,
                 },
                 evaluation_report=report,
+                replay_evaluation_report=self._artifact_replay_report(),
+                replay_suite_report=self._artifact_replay_suite_report(),
                 artifact_root=Path(temp_dir) / "artifacts",
                 created_at="2026-05-31T120102Z",
                 git_sha="abc1234",
@@ -221,6 +266,12 @@ class SystemTest(unittest.TestCase):
             self.assertTrue(bundle.manifest_path.exists())
             self.assertTrue((bundle.bundle_dir / "evaluation.json").exists())
             self.assertTrue((bundle.bundle_dir / "evaluation.md").exists())
+            self.assertTrue((bundle.bundle_dir / "replay_evaluation.json").exists())
+            self.assertTrue((bundle.bundle_dir / "replay_suite.json").exists())
+            manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["replay_dataset_fingerprint"], "replay-fingerprint")
+            self.assertTrue(manifest["replay_evaluation_metrics"]["passed"])
+            self.assertTrue(manifest["replay_suite_metrics"]["passed"])
             validate_model_manifest(bundle.model_path, backend="xgboost")
             backend, resolved_model_path = resolve_model_artifact(
                 bundle.artifact_id,
@@ -249,6 +300,25 @@ class SystemTest(unittest.TestCase):
             self.assertEqual(manifest["status"], "promoted")
             self.assertEqual(registry["promoted"]["xgboost"], bundle.artifact_id)
             self.assertEqual(registry["artifacts"][0]["status"], "promoted")
+            self.assertTrue(registry["artifacts"][0]["replay_passed"])
+            self.assertEqual(registry["artifacts"][0]["replay_mae_lap_delta_s"], 0.1)
+
+    def test_artifact_release_detail_exposes_blockers_and_reports(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle = self._create_test_artifact(temp_dir, report=self._artifact_test_report())
+
+            detail = artifact_release_detail(
+                bundle.artifact_id,
+                artifact_root=Path(temp_dir) / "artifacts",
+            )
+
+            self.assertTrue(detail["promotion_ready"])
+            self.assertEqual(detail["promotion_failures"], [])
+            self.assertEqual(detail["manifest"]["artifact_id"], bundle.artifact_id)
+            self.assertIsNotNone(detail["evaluation"])
+            self.assertIsNotNone(detail["replay_evaluation"])
+            self.assertIsNotNone(detail["replay_suite"])
+            self.assertTrue(detail["replay_evaluation"]["passed"])
 
     def test_promote_artifact_rejects_failed_gates_without_registry_promotion(self) -> None:
         report = self._artifact_test_report(
@@ -278,6 +348,57 @@ class SystemTest(unittest.TestCase):
             self.assertEqual(registry["promoted"], {})
             self.assertEqual(registry["artifacts"][0]["status"], "candidate")
 
+    def test_promote_artifact_rejects_missing_replay_evaluation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            model_path = Path(temp_dir) / "model.json"
+            model_path.write_text("{}", encoding="utf-8")
+            bundle = create_model_artifact_bundle(
+                model_path=model_path,
+                backend="xgboost",
+                training_config={
+                    "backend": "xgboost",
+                    "laps": 2,
+                    "seeds": 3,
+                    "rounds": 4,
+                    "training_rows": 18,
+                },
+                evaluation_report=self._artifact_test_report(),
+                artifact_root=Path(temp_dir) / "artifacts",
+                created_at="2026-05-31T120102Z",
+                git_sha="abc1234",
+            )
+
+            result = promote_artifact(
+                bundle.artifact_id,
+                artifact_root=Path(temp_dir) / "artifacts",
+            )
+
+            self.assertFalse(result.promoted)
+            self.assertTrue(any("replay" in failure for failure in result.failures))
+
+    def test_promote_artifact_rejects_failed_replay_evaluation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle = self._create_test_artifact(
+                temp_dir,
+                report=self._artifact_test_report(),
+                replay_report=self._artifact_replay_report(
+                    passed=False,
+                    mae_lap_delta_s=1.2,
+                    coverage_pct=20.0,
+                    missing_target_pct=25.0,
+                    monotonic_wear_violations=2,
+                ),
+                replay_suite_report=self._artifact_replay_suite_report(passed=False),
+            )
+
+            result = promote_artifact(
+                bundle.artifact_id,
+                artifact_root=Path(temp_dir) / "artifacts",
+            )
+
+            self.assertFalse(result.promoted)
+            self.assertTrue(any("replay" in failure for failure in result.failures))
+
     def test_monitoring_catalog_and_export_cover_spec_metrics(self) -> None:
         catalog = monitoring_catalog()
         self.assertIn("rmse", catalog["ml"])
@@ -303,7 +424,7 @@ class SystemTest(unittest.TestCase):
         prediction = engine.ingest(event)
 
         self.assertNotEqual(prediction.model_backend, "unknown")
-        self.assertEqual(prediction.model_artifact_id, "unregistered")
+        self.assertNotEqual(prediction.model_artifact_id, "unknown")
         self.assertEqual(prediction.model_feature_schema_hash, feature_schema_hash())
 
         performance = engine.model_performance()
@@ -311,10 +432,10 @@ class SystemTest(unittest.TestCase):
 
         self.assertEqual(len(performance), 1)
         self.assertEqual(performance[0]["backend"], prediction.model_backend)
-        self.assertEqual(performance[0]["artifact_id"], "unregistered")
+        self.assertEqual(performance[0]["artifact_id"], prediction.model_artifact_id)
         self.assertEqual(performance[0]["evaluations"], 1)
         self.assertGreaterEqual(performance[0]["mae_lap_delta_s"], 0.0)
-        self.assertIn('f1_model_mae_lap_delta_s{artifact_id="unregistered"', metrics)
+        self.assertIn(f'f1_model_mae_lap_delta_s{{artifact_id="{prediction.model_artifact_id}"', metrics)
         self.assertIn("f1_model_rmse_lap_delta_s", metrics)
         self.assertIn("f1_model_interval_coverage_pct", metrics)
         self.assertIn("f1_model_evaluations_total", metrics)
@@ -424,6 +545,75 @@ class SystemTest(unittest.TestCase):
             assert candidate is not None
             self.assertEqual(candidate["artifact_id"], first.artifact_id)
 
+    def test_engine_auto_loads_latest_promoted_artifact(self) -> None:
+        try:
+            import xgboost  # noqa: F401
+        except ImportError as exc:
+            self.skipTest(f"XGBoost is not installed: {exc}")
+
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "artifacts"
+            model_path = train_xgboost_model(
+                str(Path(temp_dir) / "xgboost_lap_delta.json"),
+                laps=1,
+                seeds=1,
+                rounds=1,
+            )
+            bundle = create_model_artifact_bundle(
+                model_path=model_path,
+                backend="xgboost",
+                training_config={
+                    "backend": "xgboost",
+                    "laps": 1,
+                    "seeds": 1,
+                    "rounds": 1,
+                    "training_rows": 1,
+                },
+                evaluation_report=self._artifact_test_report(),
+                replay_evaluation_report=self._artifact_replay_report(),
+                replay_suite_report=self._artifact_replay_suite_report(),
+                artifact_root=root,
+                created_at="2026-05-31T120402Z",
+                git_sha="ddd444",
+            )
+            promote_artifact(bundle.artifact_id, artifact_root=root)
+
+            settings = load_settings().__class__(
+                model_backend="auto",
+                model_artifact_id="",
+                model_artifact_root=str(root),
+            )
+            engine = InferenceEngine(settings=settings)
+
+            self.assertEqual(engine.settings.model_artifact_id, bundle.artifact_id)
+            self.assertEqual(engine._active_model_artifact_id(), bundle.artifact_id)
+
+    def test_prune_artifact_registry_archives_old_candidates(self) -> None:
+        report = self._artifact_test_report()
+        with TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir) / "artifacts"
+            old = self._create_test_artifact(
+                temp_dir,
+                report=report,
+                created_at="2026-05-31T120001Z",
+                git_sha="old111",
+            )
+            new = self._create_test_artifact(
+                temp_dir,
+                report=report,
+                created_at="2026-05-31T120002Z",
+                git_sha="new222",
+            )
+
+            result = prune_artifact_registry(root, keep_candidates_per_backend=1)
+            registry = load_registry(root)
+            statuses = {item["artifact_id"]: item["status"] for item in registry["artifacts"]}
+
+            self.assertIn(old.artifact_id, result.archived)
+            self.assertIn(new.artifact_id, result.kept)
+            self.assertEqual(statuses[old.artifact_id], "archived")
+            self.assertEqual(statuses[new.artifact_id], "candidate")
+
     def test_artifact_id_loaded_model_reports_registered_identity(self) -> None:
         try:
             import xgboost  # noqa: F401
@@ -450,6 +640,8 @@ class SystemTest(unittest.TestCase):
                     "training_rows": 1,
                 },
                 evaluation_report=report,
+                replay_evaluation_report=self._artifact_replay_report(),
+                replay_suite_report=self._artifact_replay_suite_report(),
                 artifact_root=root,
                 created_at="2026-05-31T120302Z",
                 git_sha="ccc333",
@@ -488,10 +680,25 @@ class SystemTest(unittest.TestCase):
         self.assertIsInstance(create_persistence_store("none", "ignored.duckdb"), NullPersistence)
         with TemporaryDirectory() as temp_dir:
             auto_store = create_persistence_store("auto", str(Path(temp_dir) / "state.duckdb"))
-            self.assertIn(auto_store.backend_name, {"none", "duckdb"})
+            self.assertIn(auto_store.backend_name, {"memory", "duckdb"})
             if hasattr(auto_store, "close"):
                 auto_store.close()
         self.assertEqual(create_persistence_store("none", "ignored.duckdb").run_summaries(), [])
+
+    def test_memory_persistence_lists_run_summaries(self) -> None:
+        persistence = InMemoryPersistence()
+        engine = InferenceEngine(persistence=persistence)
+        simulator = RaceSimulator(SimulationConfig(session_id="sim-race-memory", laps=2, seed=14))
+        for event in simulator.events():
+            prediction = engine.ingest(event)
+        engine.strategy(prediction.session_id, prediction.car_id, remaining_laps=20)
+
+        summaries = persistence.run_summaries()
+
+        self.assertEqual(len(summaries), 1)
+        self.assertEqual(summaries[0]["session_id"], "sim-race-memory")
+        self.assertEqual(summaries[0]["prediction_count"], 6)
+        self.assertIsNotNone(summaries[0]["latest_strategy"])
 
     def test_duckdb_persistence_records_rows_when_available(self) -> None:
         try:
@@ -533,14 +740,16 @@ class SystemTest(unittest.TestCase):
         self.assertGreaterEqual(prediction_count, 2)
         self.assertEqual(evaluation_count, 2)
         self.assertNotEqual(prediction_identity[0], "unknown")
-        self.assertEqual(prediction_identity[1], "unregistered")
+        self.assertNotEqual(prediction_identity[1], "unknown")
         self.assertEqual(evaluation_identity[0], prediction_identity[0])
-        self.assertEqual(evaluation_identity[1], "unregistered")
+        self.assertEqual(evaluation_identity[1], prediction_identity[1])
 
     def _create_test_artifact(
         self,
         temp_dir: str,
         report: EvaluationReport,
+        replay_report: ReplayEvaluationReport | None = None,
+        replay_suite_report: ReplaySuiteReport | None = None,
         created_at: str = "2026-05-31T120102Z",
         git_sha: str = "abc1234",
     ) -> object:
@@ -557,6 +766,8 @@ class SystemTest(unittest.TestCase):
                 "training_rows": 18,
             },
             evaluation_report=report,
+            replay_evaluation_report=replay_report or self._artifact_replay_report(),
+            replay_suite_report=replay_suite_report or self._artifact_replay_suite_report(),
             artifact_root=Path(temp_dir) / "artifacts",
             created_at=created_at,
             git_sha=git_sha,
@@ -587,6 +798,69 @@ class SystemTest(unittest.TestCase):
                     monotonic_wear_violations=monotonic_wear_violations,
                 )
             ],
+        )
+
+    def _artifact_replay_report(
+        self,
+        passed: bool = True,
+        mae_lap_delta_s: float = 0.1,
+        coverage_pct: float = 100.0,
+        latency_p95_ms: float = 1.0,
+        missing_target_pct: float = 0.0,
+        monotonic_wear_violations: int = 0,
+    ) -> ReplayEvaluationReport:
+        return ReplayEvaluationReport(
+            version=APP_VERSION,
+            feature_schema_version="online-features-v1",
+            feature_schema_hash=feature_schema_hash(),
+            dataset_path="examples/replay_telemetry.csv",
+            dataset_fingerprint="replay-fingerprint",
+            session_count=1,
+            event_count=12,
+            labeled_event_count=12,
+            missing_target_pct=missing_target_pct,
+            scenario=ScenarioEvaluation(
+                scenario="replay-unit",
+                laps=1,
+                compound="mixed",
+                observations=12,
+                mae_lap_delta_s=mae_lap_delta_s,
+                rmse_lap_delta_s=mae_lap_delta_s,
+                mean_interval_width_s=0.4,
+                coverage_pct=coverage_pct,
+                latency_p95_ms=latency_p95_ms,
+                monotonic_wear_violations=monotonic_wear_violations,
+                source="replay",
+                event_count=12,
+            ),
+            gates={
+                "mae_lap_delta": passed,
+                "coverage": passed,
+                "calibration": passed,
+                "sharpness": passed,
+                "latency": passed,
+                "monotonic_wear": passed,
+                "target_completeness": passed,
+                "sample_size": passed,
+                "pit_decision": passed,
+                "strategy_regret": passed,
+            },
+            passed=passed,
+        )
+
+    def _artifact_replay_suite_report(self, passed: bool = True) -> ReplaySuiteReport:
+        split = self._artifact_replay_report(passed=passed)
+        return ReplaySuiteReport(
+            version=APP_VERSION,
+            feature_schema_version="online-features-v1",
+            feature_schema_hash=feature_schema_hash(),
+            split_count=1,
+            passed=passed,
+            mean_mae_lap_delta_s=split.scenario.mae_lap_delta_s,
+            mean_coverage_pct=split.scenario.coverage_pct,
+            total_event_count=split.event_count,
+            total_labeled_event_count=split.labeled_event_count,
+            splits=[split],
         )
 
     def test_duckdb_persistence_lists_run_summaries_when_available(self) -> None:

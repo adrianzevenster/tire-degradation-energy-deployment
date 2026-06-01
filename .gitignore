@@ -21,7 +21,6 @@ env/
 .env.local
 
 # IDE/editor state
-.codex
 .idea/
 .vscode/
 *.swp

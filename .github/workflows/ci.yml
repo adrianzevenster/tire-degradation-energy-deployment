@@ -43,6 +43,13 @@ jobs:
       - name: Run model regression gates
         run: python -m f1_strategy.regression
 
+      - name: Run replay and report gates
+        run: |
+          python -m f1_strategy.replay --dataset examples/replay_telemetry.csv
+          python -m f1_strategy.replay --suite
+          python -m f1_strategy.evaluation --format json --output reports/model-evaluation.json
+          python -m f1_strategy.evaluation --format markdown --output reports/model-evaluation.md
+
       - name: Verify CLI startup
         run: |
           python -m f1_strategy.cli --version
@@ -50,6 +57,12 @@ jobs:
 
       - name: Build package
         run: python -m build
+
+      - name: Upload evaluation reports
+        uses: actions/upload-artifact@v4
+        with:
+          name: evaluation-reports-${{ matrix.python-version }}
+          path: reports/
 
   docker-gate:
     name: Docker build gate
@@ -95,6 +108,7 @@ jobs:
         run: |
           python -m f1_strategy.cli --laps 2
           python -m f1_strategy.regression
+          python -m f1_strategy.replay --suite
           python - <<'PY'
           from f1_strategy.engine import InferenceEngine
 
@@ -113,6 +127,7 @@ jobs:
         run: |
           python -m f1_strategy.cli --laps 2
           python -m f1_strategy.regression
+          python -m f1_strategy.replay --suite
 
   kalman-gate:
     name: Kalman serving gate
@@ -139,6 +154,7 @@ jobs:
         run: |
           python -m f1_strategy.cli --laps 2
           python -m f1_strategy.regression
+          python -m f1_strategy.replay --suite
 
   extended-model-gate:
     name: Extended optional model gates

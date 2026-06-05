@@ -7,7 +7,12 @@ const state = {
   readiness: null,
   alerts: { health_score: 0, alerts: [] },
   comparison: [],
+  replayEvaluation: null,
+  replaySuite: null,
   artifacts: [],
+  artifactRegistry: { promoted: {}, active_artifact_id: "unregistered" },
+  selectedArtifactId: null,
+  artifactDetail: null,
   strategy: null,
   latestTelemetry: null,
   history: [],
@@ -117,6 +122,7 @@ async function refreshModels() {
 async function refreshArtifacts() {
   const payload = await api("/artifacts");
   state.artifacts = payload.artifacts || [];
+  state.artifactRegistry = payload;
   const select = el("artifactSelect");
   const active = payload.active_artifact_id || "unregistered";
   select.innerHTML = `<option value="">Unregistered</option>`;
@@ -129,6 +135,35 @@ async function refreshArtifacts() {
   }
   select.value = active === "unregistered" ? "" : active;
   select.title = active;
+  const selected =
+    (active !== "unregistered" && state.artifacts.some((item) => item.artifact_id === active))
+      ? active
+      : state.selectedArtifactId;
+  if (!selected && state.artifacts.length) {
+    state.selectedArtifactId = state.artifacts[0].artifact_id;
+  } else if (selected) {
+    state.selectedArtifactId = selected;
+  }
+  await refreshArtifactDetail();
+}
+
+async function refreshArtifactDetail() {
+  if (!state.selectedArtifactId) {
+    state.artifactDetail = null;
+    renderArtifactRelease();
+    return;
+  }
+  try {
+    state.artifactDetail = await api(`/artifacts/${encodeURIComponentPath(state.selectedArtifactId)}`);
+  } catch (error) {
+    state.artifactDetail = null;
+    setNotice(`Could not load artifact detail: ${error.message}`, "error");
+  }
+  renderArtifactRelease();
+}
+
+function encodeURIComponentPath(value) {
+  return String(value).split("/").map(encodeURIComponent).join("/");
 }
 
 async function changeModelBackend() {
@@ -201,13 +236,17 @@ async function refreshMetrics() {
 
 async function refreshOps() {
   try {
-    const [readiness, alerts] = await Promise.all([
+    const [readiness, alerts, replayEvaluation, replaySuite] = await Promise.all([
       api("/deployment/readiness"),
       api("/monitoring/alerts"),
+      api("/evaluation/replay"),
+      api("/evaluation/replay-suite"),
       refreshMetrics(),
     ]);
     state.readiness = readiness;
     state.alerts = alerts;
+    state.replayEvaluation = replayEvaluation;
+    state.replaySuite = replaySuite;
     state.comparison = (await api("/monitoring/model-comparison")).models || [];
     renderOps();
   } catch (error) {
@@ -441,12 +480,24 @@ function resetDashboard() {
   el("healthScoreValue").textContent = "-";
   el("alertCountValue").textContent = "-";
   el("rollbackValue").textContent = "-";
+  el("replayGateValue").textContent = "-";
+  el("activeArtifactValue").textContent = "-";
+  el("promotedArtifactValue").textContent = "-";
   el("readinessChecks").innerHTML = "";
   el("alertList").innerHTML = "";
+  el("replaySummary").innerHTML = "";
+  el("replayGates").innerHTML = "";
+  el("replaySuiteRows").innerHTML = `<tr><td colspan="8">No replay suite</td></tr>`;
+  el("artifactRows").innerHTML = `<tr><td colspan="6">No registered artifacts</td></tr>`;
+  el("artifactDetailGrid").innerHTML = "";
+  el("artifactBlockers").innerHTML = "";
+  el("artifactSuiteRows").innerHTML = `<tr><td colspan="9">No replay suite</td></tr>`;
+  el("artifactReleaseState").textContent = "No artifacts";
   el("comparisonRows").innerHTML = `<tr><td colspan="9">No evaluated models</td></tr>`;
   el("comparisonState").textContent = "No evaluated models";
   el("readinessState").textContent = "Waiting";
   el("alertState").textContent = "0 active";
+  el("replayState").textContent = "Waiting";
   state.latestTelemetry = null;
   renderTirePressureMap();
   drawCharts();
@@ -543,9 +594,11 @@ function renderOps() {
   const rollback = readiness.rollback_candidate;
   el("rollbackValue").textContent = rollback ? shortRunId(rollback.artifact_id) : "None";
   el("rollbackValue").title = rollback?.artifact_id || "";
+  renderArtifactAlignment(readiness);
   el("readinessState").textContent =
     `${readiness.active_backend} / ${readiness.active_artifact_id}`;
   el("alertState").textContent = `${alerts.length} active`;
+  renderReplayEvaluation();
 
   const checks = el("readinessChecks");
   checks.innerHTML = "";
@@ -574,6 +627,102 @@ function renderOps() {
   }
   renderOpsCharts();
   renderModelComparison();
+  renderArtifactRelease();
+}
+
+function renderArtifactAlignment(readiness) {
+  const active = readiness.active_artifact_id || state.artifactRegistry.active_artifact_id || "unregistered";
+  const promoted = promotedArtifactForBackend(readiness.active_backend);
+  const aligned = active !== "unregistered" && promoted && active === promoted;
+  el("activeArtifactValue").textContent = shortRunId(active);
+  el("activeArtifactValue").title = active;
+  el("activeArtifactValue").className = aligned ? "risk-low" : "risk-medium";
+  el("promotedArtifactValue").textContent = promoted ? shortRunId(promoted) : "None";
+  el("promotedArtifactValue").title = promoted || "";
+  el("promotedArtifactValue").className = promoted ? "risk-low" : "risk-medium";
+}
+
+function promotedArtifactForBackend(activeBackend) {
+  const promoted = state.artifactRegistry.promoted || {};
+  const normalized = String(activeBackend || "").replace("-torch", "");
+  return promoted[normalized] || promoted.sequence || Object.values(promoted)[0] || "";
+}
+
+function renderReplayEvaluation() {
+  const report = state.replayEvaluation;
+  if (!report) {
+    el("replayGateValue").textContent = "-";
+    el("replayState").textContent = "Waiting";
+    return;
+  }
+  const scenario = report.scenario || {};
+  el("replayGateValue").textContent = report.passed ? "Pass" : "Fail";
+  el("replayGateValue").className = report.passed ? "risk-low" : "risk-high";
+  el("replayState").textContent =
+    `${shortRunId(report.dataset_path)} / ${String(report.dataset_fingerprint || "").slice(0, 8)}`;
+  el("replayState").title = report.dataset_fingerprint || "";
+
+  const summary = el("replaySummary");
+  summary.innerHTML = "";
+  const items = [
+    ["Source", scenario.source || "replay"],
+    ["Events", report.event_count],
+    ["Labels", `${report.labeled_event_count} / ${report.event_count}`],
+    ["Sessions", report.session_count],
+    ["MAE", `${num(scenario.mae_lap_delta_s, 4)}s`],
+    ["RMSE", `${num(scenario.rmse_lap_delta_s, 4)}s`],
+    ["Coverage", `${num(scenario.coverage_pct, 1)}%`],
+    ["Calibration", `${num(scenario.calibration_error_pct, 1)}%`],
+    ["Sharpness", `${num(scenario.mean_interval_width_s, 3)}s`],
+    ["Pit Error", `${num(scenario.pit_target_error_laps, 2)} laps`],
+    ["Regret", `${num(scenario.strategy_regret_s, 3)}s`],
+    ["p95 Latency", `${num(scenario.latency_p95_ms, 3)} ms`],
+    ["Wear Violations", scenario.monotonic_wear_violations],
+    ["Missing Targets", `${num(report.missing_target_pct, 1)}%`],
+    ["Schema", String(report.feature_schema_hash || "").slice(0, 8)],
+    ["Dataset", shortRunId(report.dataset_path)],
+  ];
+  for (const [label, value] of items) {
+    const item = document.createElement("div");
+    item.className = "detail-item";
+    item.innerHTML = `<span>${label}</span><strong title="${value}">${value}</strong>`;
+    summary.appendChild(item);
+  }
+
+  const gates = el("replayGates");
+  gates.innerHTML = "";
+  for (const [name, passed] of Object.entries(report.gates || {})) {
+    const item = document.createElement("div");
+    item.className = `check-item ${passed ? "pass" : "fail"}`;
+    item.innerHTML = `<span>${name.replaceAll("_", " ")}</span><strong>${passed ? "Pass" : "Fail"}</strong>`;
+    gates.appendChild(item);
+  }
+  renderReplaySuite(state.replaySuite);
+}
+
+function renderReplaySuite(suite) {
+  const rows = el("replaySuiteRows");
+  rows.innerHTML = "";
+  const splits = suite?.splits || [];
+  if (!splits.length) {
+    rows.innerHTML = `<tr><td colspan="9">No replay suite</td></tr>`;
+    return;
+  }
+  for (const split of splits) {
+    const scenario = split.scenario || {};
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td>${scenario.scenario || "-"}</td>
+      <td class="${split.passed ? "risk-low" : "risk-high"}">${split.passed ? "Pass" : "Fail"}</td>
+      <td>${num(scenario.mae_lap_delta_s, 4)}s</td>
+      <td>${num(scenario.coverage_pct, 1)}%</td>
+      <td>${num(scenario.calibration_error_pct, 1)}%</td>
+      <td>${num(scenario.mean_interval_width_s, 3)}s</td>
+      <td>${num(scenario.pit_target_error_laps, 2)}</td>
+      <td>${num(scenario.strategy_regret_s, 3)}s</td>
+    `;
+    rows.appendChild(row);
+  }
 }
 
 function renderModelComparison() {
@@ -602,6 +751,141 @@ function renderModelComparison() {
     table.appendChild(item);
   }
   drawComparisonChart(rows);
+}
+
+function renderArtifactRelease() {
+  const rows = el("artifactRows");
+  const artifacts = state.artifacts || [];
+  rows.innerHTML = "";
+  el("artifactReleaseState").textContent = artifacts.length
+    ? `${artifacts.length} registered`
+    : "No artifacts";
+  if (!artifacts.length) {
+    rows.innerHTML = `<tr><td colspan="6">No registered artifacts</td></tr>`;
+    renderArtifactDetail();
+    return;
+  }
+  if (!state.selectedArtifactId || !artifacts.some((item) => item.artifact_id === state.selectedArtifactId)) {
+    state.selectedArtifactId = artifacts[0].artifact_id;
+  }
+  for (const artifact of artifacts) {
+    const replayPassed = artifact.replay_passed;
+    const item = document.createElement("tr");
+    item.className = artifact.artifact_id === state.selectedArtifactId ? "selected" : "";
+    item.tabIndex = 0;
+    item.title = artifact.artifact_id;
+    item.innerHTML = `
+      <td>${shortRunId(artifact.artifact_id)}</td>
+      <td>${artifact.status || "-"}</td>
+      <td class="${replayPassed === true ? "risk-low" : "risk-high"}">${replayPassed === true ? "Pass" : "Missing"}</td>
+      <td>${num(artifact.replay_mae_lap_delta_s, 4)}s</td>
+      <td>${num(artifact.replay_coverage_pct, 1)}%</td>
+      <td title="${artifact.replay_dataset_fingerprint || ""}">${shortRunId(artifact.replay_dataset_fingerprint || "-")}</td>
+    `;
+    item.addEventListener("click", () => selectArtifact(artifact.artifact_id));
+    item.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectArtifact(artifact.artifact_id);
+      }
+    });
+    rows.appendChild(item);
+  }
+  renderArtifactDetail();
+}
+
+async function selectArtifact(artifactId) {
+  state.selectedArtifactId = artifactId;
+  renderArtifactRelease();
+  await refreshArtifactDetail();
+}
+
+function renderArtifactDetail() {
+  const detail = state.artifactDetail;
+  const grid = el("artifactDetailGrid");
+  const blockers = el("artifactBlockers");
+  grid.innerHTML = "";
+  blockers.innerHTML = "";
+  if (!state.selectedArtifactId) {
+    grid.innerHTML = `<div class="detail-item"><span>Status</span><strong>No artifact selected</strong></div>`;
+    return;
+  }
+  if (!detail) {
+    grid.innerHTML = `<div class="detail-item"><span>Artifact</span><strong>${shortRunId(state.selectedArtifactId)}</strong></div>`;
+    blockers.innerHTML = `<div class="check-item fail"><span>Detail</span><strong>Unavailable</strong></div>`;
+    return;
+  }
+  const manifest = detail.manifest || {};
+  const evalMetrics = manifest.evaluation_metrics || {};
+  const replayMetrics = manifest.replay_evaluation_metrics || {};
+  const items = [
+    ["Artifact", shortRunId(detail.artifact_id)],
+    ["Backend", manifest.backend || "-"],
+    ["Status", manifest.status || "-"],
+    ["Promotion", detail.promotion_ready ? "Ready" : "Blocked"],
+    ["Git SHA", manifest.git_sha || "-"],
+    ["Created", manifest.created_at || "-"],
+    ["Schema", String(manifest.feature_schema_hash || "").slice(0, 8)],
+    ["Simulator MAE", `${num(evalMetrics.mean_mae_lap_delta_s, 4)}s`],
+    ["Simulator Coverage", `${num(evalMetrics.mean_coverage_pct, 1)}%`],
+    ["Max Cal Error", `${num(evalMetrics.max_calibration_error_pct, 1)}%`],
+    ["Max Width", `${num(evalMetrics.max_mean_interval_width_s, 3)}s`],
+    ["Max Pit Error", `${num(evalMetrics.max_pit_target_error_laps, 2)} laps`],
+    ["Max Regret", `${num(evalMetrics.max_strategy_regret_s, 3)}s`],
+    ["Replay MAE", `${num(replayMetrics.mae_lap_delta_s, 4)}s`],
+    ["Replay Coverage", `${num(replayMetrics.coverage_pct, 1)}%`],
+    ["Replay Cal Error", `${num(replayMetrics.calibration_error_pct, 1)}%`],
+    ["Replay Width", `${num(replayMetrics.mean_interval_width_s, 3)}s`],
+    ["Replay Pit Error", `${num(replayMetrics.pit_target_error_laps, 2)} laps`],
+    ["Replay Regret", `${num(replayMetrics.strategy_regret_s, 3)}s`],
+    ["Suite", manifest.replay_suite_metrics?.passed ? "Pass" : "Blocked"],
+    ["Suite Splits", manifest.replay_suite_metrics?.split_count || "-"],
+    ["Replay Dataset", shortRunId(manifest.replay_dataset_fingerprint || "-")],
+  ];
+  for (const [label, value] of items) {
+    const item = document.createElement("div");
+    item.className = "detail-item";
+    item.innerHTML = `<span>${label}</span><strong title="${value}">${value}</strong>`;
+    grid.appendChild(item);
+  }
+  const failures = detail.promotion_failures || [];
+  if (!failures.length) {
+    blockers.innerHTML = `<div class="check-item pass"><span>Promotion blockers</span><strong>Clear</strong></div>`;
+  } else {
+    for (const failure of failures.slice(0, 8)) {
+      const item = document.createElement("div");
+      item.className = "check-item fail";
+      item.innerHTML = `<span title="${failure}">${failure}</span><strong>Block</strong>`;
+      blockers.appendChild(item);
+    }
+  }
+  renderArtifactSuite(detail.replay_suite);
+}
+
+function renderArtifactSuite(suite) {
+  const rows = el("artifactSuiteRows");
+  rows.innerHTML = "";
+  const splits = suite?.splits || [];
+  if (!splits.length) {
+    rows.innerHTML = `<tr><td colspan="8">No replay suite</td></tr>`;
+    return;
+  }
+  for (const split of splits) {
+    const scenario = split.scenario || {};
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td>${scenario.scenario || "-"}</td>
+      <td class="${split.passed ? "risk-low" : "risk-high"}">${split.passed ? "Pass" : "Fail"}</td>
+      <td>${num(scenario.mae_lap_delta_s, 4)}s</td>
+      <td>${num(scenario.coverage_pct, 1)}%</td>
+      <td>${num(scenario.calibration_error_pct, 1)}%</td>
+      <td>${num(scenario.mean_interval_width_s, 3)}s</td>
+      <td>${num(scenario.pit_target_error_laps, 2)}</td>
+      <td>${num(scenario.strategy_regret_s, 3)}s</td>
+      <td title="${split.dataset_fingerprint || ""}">${shortRunId(split.dataset_path || "-")}</td>
+    `;
+    rows.appendChild(row);
+  }
 }
 
 function renderOpsCharts() {

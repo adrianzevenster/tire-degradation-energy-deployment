@@ -7,8 +7,9 @@ ARTIFACT_ID ?=
 TRAIN_LAPS ?= 28
 TRAIN_SEEDS ?= 64
 TRAIN_ROUNDS ?= 140
+REPLAY_DATASET ?= examples/replay_telemetry.csv
 
-.PHONY: help install install-api install-persistence compile test regression evaluate reports train train-evaluate promote-artifact rollback-candidate
+.PHONY: help install install-api install-persistence compile test regression evaluate replay-evaluate reports train train-evaluate register-local-artifacts prune-artifacts promote-artifact rollback-candidate
 .PHONY: ci docker-build clean-reports
 
 help:
@@ -21,9 +22,12 @@ help:
 		'  test                 Run unittest suite' \
 		'  regression           Run deterministic regression gates' \
 		'  evaluate             Print Markdown evaluation report' \
+		'  replay-evaluate      Run replay holdout gates against REPLAY_DATASET' \
 		'  reports              Write JSON and Markdown evaluation reports' \
 		'  train                Train MODEL_BACKEND artifact to MODEL_OUTPUT' \
 		'  train-evaluate       Train, evaluate, and register an artifact bundle' \
+		'  register-local-artifacts Register existing models/ files as artifact bundles' \
+		'  prune-artifacts      Archive older candidate artifacts' \
 		'  promote-artifact     Promote ARTIFACT_ID after registry gate checks' \
 		'  rollback-candidate   Print latest promoted rollback candidate' \
 		'  ci                   Run compile, test, regression, and reports' \
@@ -50,6 +54,9 @@ regression:
 evaluate:
 	$(PYTHON) -m f1_strategy.evaluation --format markdown
 
+replay-evaluate:
+	$(PYTHON) -m f1_strategy.replay --dataset $(REPLAY_DATASET)
+
 reports:
 	mkdir -p $(REPORT_DIR)
 	$(PYTHON) -m f1_strategy.evaluation --format json --output $(REPORT_DIR)/model-evaluation.json
@@ -70,6 +77,16 @@ train-evaluate:
 		--laps $(TRAIN_LAPS) \
 		--seeds $(TRAIN_SEEDS) \
 		--rounds $(TRAIN_ROUNDS) \
+		--artifact-root $(ARTIFACT_ROOT) \
+		--replay-dataset $(REPLAY_DATASET)
+
+register-local-artifacts:
+	$(PYTHON) -m f1_strategy.artifacts register-local \
+		--artifact-root $(ARTIFACT_ROOT) \
+		--replay-dataset $(REPLAY_DATASET)
+
+prune-artifacts:
+	$(PYTHON) -m f1_strategy.artifacts prune \
 		--artifact-root $(ARTIFACT_ROOT)
 
 promote-artifact:

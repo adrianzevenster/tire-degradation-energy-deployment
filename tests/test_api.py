@@ -34,6 +34,9 @@ class ApiTest(unittest.TestCase):
         self.assertIn("/simulation/tick", paths)
         self.assertIn("/simulation/reset", paths)
         self.assertIn("/history/runs", paths)
+        self.assertIn("/evaluation/replay", paths)
+        self.assertIn("/evaluation/replay-suite", paths)
+        self.assertIn("/artifacts/{artifact_id:path}", paths)
 
     def test_health_and_ui_index_are_available(self) -> None:
         health = self.api.health()
@@ -77,7 +80,7 @@ class ApiTest(unittest.TestCase):
         self.assertIn("metrics", tick)
 
         history = self.api.history_runs(limit=3)
-        self.assertIn(history["persistence_backend"], {"none", "duckdb"})
+        self.assertIn(history["persistence_backend"], {"memory", "duckdb"})
         self.assertIsInstance(history["runs"], list)
 
         performance = self.api.model_performance()
@@ -98,6 +101,14 @@ class ApiTest(unittest.TestCase):
         readiness = self.api.deployment_readiness()
         self.assertIn("ready", readiness)
         self.assertIn("checks", readiness)
+
+        replay = self.api.replay_evaluation()
+        self.assertTrue(replay["passed"])
+        self.assertEqual(replay["scenario"]["source"], "replay")
+        self.assertIn("dataset_fingerprint", replay)
+        replay_suite = self.api.replay_suite()
+        self.assertTrue(replay_suite["passed"])
+        self.assertGreaterEqual(replay_suite["split_count"], 5)
 
         reset = self.api.simulation_reset()
         self.assertFalse(reset["running"])

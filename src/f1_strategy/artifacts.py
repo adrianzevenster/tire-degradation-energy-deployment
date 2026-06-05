@@ -24,6 +24,7 @@ from f1_strategy.deployment import load_registry, rollback_candidate
 from f1_strategy.replay import (
     ReplayEvaluationReport,
     ReplaySuiteReport,
+    run_benchmark_replay_suite,
     replay_report_to_dict,
     replay_suite_to_dict,
 )
@@ -63,6 +64,9 @@ class PromotionGateConfig:
     max_strategy_regret_s: float = 2.5
     require_replay_evaluation: bool = True
     require_replay_suite: bool = True
+    required_replay_suite_name: str = "benchmark"
+    min_replay_suite_split_count: int = 5
+    require_production_replay_validation: bool = False
 
 
 @dataclass(frozen=True)
@@ -132,7 +136,7 @@ def register_existing_model_artifact(
     from f1_strategy.engine import InferenceEngine
     from f1_strategy.evaluation import run_evaluation
     from f1_strategy.models import ModelConfig, create_serving_model
-    from f1_strategy.replay import run_replay_evaluation, run_replay_suite
+    from f1_strategy.replay import run_replay_evaluation
 
     path = Path(model_path)
     if not path.exists():
@@ -154,7 +158,7 @@ def register_existing_model_artifact(
         replay_dataset,
         engine=InferenceEngine(model=serving_model),
     )
-    replay_suite = run_replay_suite(
+    replay_suite = run_benchmark_replay_suite(
         engine_factory=lambda: InferenceEngine(
             model=create_serving_model(
                 config=ModelConfig(),
@@ -330,11 +334,19 @@ def create_model_artifact_bundle(
         replay_suite_payload=replay_suite_payload,
         promoted=promote,
     )
+    model_card_payload = _model_card_payload(
+        manifest=manifest,
+        evaluation_payload=evaluation_payload,
+        replay_payload=replay_payload,
+        replay_suite_payload=replay_suite_payload,
+    )
+    manifest["model_card"] = "model_card.json"
 
     manifest_path = bundle_dir / "manifest.json"
     _write_json(manifest_path, manifest)
     _write_json(model_manifest_path(bundled_model_path), manifest)
     _write_json(bundle_dir / "training_config.json", training_config)
+    _write_json(bundle_dir / "model_card.json", model_card_payload)
     _write_json(bundle_dir / "evaluation.json", evaluation_payload)
     (bundle_dir / "evaluation.md").write_text(render_markdown(evaluation_report), encoding="utf-8")
     if replay_payload is not None:
@@ -423,6 +435,8 @@ def promotion_gate_failures(
                 "replay_dataset_path",
             }
         )
+        if gates.require_production_replay_validation:
+            required_keys.add("replay_data_provenance")
     if gates.require_replay_suite:
         required_keys.update(
             {
@@ -529,6 +543,13 @@ def update_registry(registry_path: str | Path, manifest: dict[str, Any], promote
         ),
         "replay_coverage_pct": manifest.get("replay_evaluation_metrics", {}).get("coverage_pct"),
         "replay_dataset_fingerprint": manifest.get("replay_dataset_fingerprint"),
+        "replay_validation_signal": manifest.get("replay_evaluation_metrics", {}).get(
+            "validation_signal"
+        ),
+        "production_validation_ready": manifest.get("replay_evaluation_metrics", {}).get(
+            "production_validation_ready",
+            False,
+        ),
         "feature_schema_hash": manifest["feature_schema_hash"],
     }
 
@@ -613,6 +634,13 @@ def build_parser() -> argparse.ArgumentParser:
     promote_parser.add_argument("--min-replay-event-count", type=int, default=12)
     promote_parser.add_argument("--max-pit-target-error-laps", type=float, default=7.0)
     promote_parser.add_argument("--max-strategy-regret", type=float, default=2.5)
+    promote_parser.add_argument("--required-replay-suite-name", default="benchmark")
+    promote_parser.add_argument("--min-replay-suite-split-count", type=int, default=5)
+    promote_parser.add_argument(
+        "--require-production-replay-validation",
+        action="store_true",
+        help="Require replay manifests with observed public labels rather than proxy-heavy data.",
+    )
     rollback_parser = subparsers.add_parser(
         "rollback-candidate",
         help="Select the latest promoted rollback artifact for a backend.",
@@ -680,6 +708,9 @@ def main() -> None:
                 min_replay_event_count=args.min_replay_event_count,
                 max_pit_target_error_laps=args.max_pit_target_error_laps,
                 max_strategy_regret_s=args.max_strategy_regret,
+                required_replay_suite_name=args.required_replay_suite_name,
+                min_replay_suite_split_count=args.min_replay_suite_split_count,
+                require_production_replay_validation=args.require_production_replay_validation,
             ),
         )
         if result.promoted:
@@ -763,6 +794,7 @@ def _artifact_manifest(
                 "replay_evaluation_report": "replay_evaluation.json",
                 "replay_dataset_path": replay_payload["dataset_path"],
                 "replay_dataset_fingerprint": replay_payload["dataset_fingerprint"],
+                "replay_data_provenance": replay_payload.get("data_provenance", {}),
                 "replay_evaluation_metrics": {
                     "passed": replay_payload["passed"],
                     "event_count": replay_payload["event_count"],
@@ -778,6 +810,12 @@ def _artifact_manifest(
                     "pit_target_error_laps": scenario.get("pit_target_error_laps"),
                     "strategy_regret_s": scenario.get("strategy_regret_s"),
                     "gates": replay_payload["gates"],
+                    "validation_signal": replay_payload.get("data_provenance", {}).get(
+                        "validation_signal"
+                    ),
+                    "production_validation_ready": replay_payload.get(
+                        "data_provenance", {}
+                    ).get("production_validation_ready", False),
                 },
             }
         )
@@ -786,6 +824,7 @@ def _artifact_manifest(
             {
                 "replay_suite_report": "replay_suite.json",
                 "replay_suite_metrics": {
+                    "suite_name": replay_suite_payload.get("suite_name", "default"),
                     "passed": replay_suite_payload["passed"],
                     "split_count": replay_suite_payload["split_count"],
                     "mean_mae_lap_delta_s": replay_suite_payload["mean_mae_lap_delta_s"],
@@ -814,6 +853,12 @@ def _artifact_manifest(
                                 "pit_target_error_laps"
                             ],
                             "strategy_regret_s": split["scenario"]["strategy_regret_s"],
+                            "validation_signal": split.get("data_provenance", {}).get(
+                                "validation_signal"
+                            ),
+                            "production_validation_ready": split.get(
+                                "data_provenance", {}
+                            ).get("production_validation_ready", False),
                         }
                         for split in replay_suite_payload["splits"]
                     ],
@@ -821,6 +866,67 @@ def _artifact_manifest(
             }
         )
     return manifest
+
+
+def _model_card_payload(
+    *,
+    manifest: dict[str, Any],
+    evaluation_payload: dict[str, Any],
+    replay_payload: dict[str, Any] | None,
+    replay_suite_payload: dict[str, Any] | None,
+) -> dict[str, Any]:
+    replay_provenance = dict((replay_payload or {}).get("data_provenance", {}))
+    replay_metrics = dict(manifest.get("replay_evaluation_metrics", {}))
+    suite_metrics = dict(manifest.get("replay_suite_metrics", {}))
+    return {
+        "artifact_id": manifest["artifact_id"],
+        "backend": manifest["backend"],
+        "app_version": manifest.get("app_version"),
+        "created_at": manifest["created_at"],
+        "git_sha": manifest["git_sha"],
+        "feature_schema_version": manifest["feature_schema_version"],
+        "feature_schema_hash": manifest["feature_schema_hash"],
+        "training": {
+            "source": "deterministic-race-simulation",
+            "parameters": manifest["training_config"],
+            "source_data_fingerprint": manifest["source_data_fingerprint"],
+        },
+        "simulator_evaluation": manifest["evaluation_metrics"],
+        "replay_evaluation": {
+            "dataset_path": manifest.get("replay_dataset_path"),
+            "dataset_fingerprint": manifest.get("replay_dataset_fingerprint"),
+            "metrics": replay_metrics,
+            "provenance": replay_provenance,
+        },
+        "benchmark_suite": suite_metrics,
+        "promotion": {
+            "status": manifest["status"],
+            "production_validation_ready": replay_metrics.get(
+                "production_validation_ready",
+                False,
+            ),
+            "validation_signal": replay_metrics.get("validation_signal"),
+            "replay_passed": replay_metrics.get("passed"),
+            "benchmark_passed": suite_metrics.get("passed"),
+        },
+        "limitations": replay_provenance.get("limitations", []),
+        "reports": {
+            "evaluation": manifest.get("evaluation_report"),
+            "replay_evaluation": manifest.get("replay_evaluation_report"),
+            "replay_suite": manifest.get("replay_suite_report"),
+        },
+        "summary": {
+            "mean_mae_lap_delta_s": evaluation_payload.get("mean_mae_lap_delta_s"),
+            "mean_coverage_pct": evaluation_payload.get("mean_coverage_pct"),
+            "replay_mae_lap_delta_s": replay_metrics.get("mae_lap_delta_s"),
+            "replay_coverage_pct": replay_metrics.get("coverage_pct"),
+            "replay_mean_interval_width_s": replay_metrics.get("mean_interval_width_s"),
+            "observed_field_count": replay_provenance.get("observed_field_count"),
+            "proxy_diagnostic_field_count": replay_provenance.get(
+                "proxy_diagnostic_field_count"
+            ),
+        },
+    }
 
 
 def _utc_timestamp() -> str:
@@ -950,6 +1056,14 @@ def _replay_gate_failures(
     if metrics.get("passed") is not True:
         failures.append(f"replay gate summary failed: passed={metrics.get('passed')}")
 
+    if gates.require_production_replay_validation:
+        production_ready = metrics.get("production_validation_ready") is True
+        if not production_ready:
+            failures.append(
+                "replay production validation gate failed: "
+                f"validation_signal={metrics.get('validation_signal')}"
+            )
+
     replay_mae = _float_metric(metrics, "mae_lap_delta_s")
     if replay_mae is None or replay_mae > gates.max_replay_mae_lap_delta_s:
         failures.append(
@@ -1067,6 +1181,24 @@ def _replay_suite_gate_failures(
     metrics = dict(manifest.get("replay_suite_metrics", {}))
     if metrics.get("passed") is not True:
         failures.append(f"replay suite summary failed: passed={metrics.get('passed')}")
+
+    if gates.required_replay_suite_name:
+        suite_name = str(metrics.get("suite_name", ""))
+        if suite_name != gates.required_replay_suite_name:
+            failures.append(
+                "replay suite name gate failed: "
+                f"value={suite_name} expected={gates.required_replay_suite_name}"
+            )
+
+    try:
+        split_count = int(metrics.get("split_count"))
+    except (TypeError, ValueError):
+        split_count = 0
+    if split_count < gates.min_replay_suite_split_count:
+        failures.append(
+            "replay suite split-count gate failed: "
+            f"value={split_count} threshold>={gates.min_replay_suite_split_count}"
+        )
 
     split_metrics = metrics.get("splits", [])
     if not split_metrics:

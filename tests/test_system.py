@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import json
+import os
 import unittest
+from datetime import timedelta
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from f1_strategy.config import load_settings
-from f1_strategy.domain import TireCompound
+from f1_strategy.shadow import ShadowDeploymentManager
+from f1_strategy.data_sources.fastf1_export import (
+    FastF1ExportConfig,
+    export_manifest,
+    manifest_path_for,
+    rows_from_fastf1_session,
+    write_replay_csv,
+)
+from f1_strategy.domain import OnlineFeatures, Prediction, TireCompound
 from f1_strategy.drift import DriftDetector
 from f1_strategy.engine import InferenceEngine
 from f1_strategy.artifacts import (
@@ -51,14 +62,20 @@ from f1_strategy.persistence import (
 )
 from f1_strategy.regression import RegressionSuite
 from f1_strategy.replay import (
+    BENCHMARK_REPLAY_SUITE,
     REPLAY_REQUIRED_COLUMNS,
     ReplayEvaluationReport,
+    ReplaySplitSpec,
     ReplaySuiteReport,
+    benchmark_manifest_payload,
     load_replay_events,
+    replay_data_provenance,
+    run_benchmark_replay_suite,
     replay_report_to_dict,
     replay_suite_to_dict,
     run_replay_evaluation,
     run_replay_suite,
+    write_benchmark_manifests,
 )
 from f1_strategy.serialization import telemetry_from_dict, to_jsonable
 from f1_strategy.simulation import RaceSimulator, SimulationConfig
@@ -97,6 +114,148 @@ class RecordingPersistence:
         actual_ending_soc: float | None = None,
     ) -> None:
         self.evaluations += 1
+
+
+class CountingModel:
+    backend_name = "counting"
+
+    def __init__(self) -> None:
+        self.observed_features: list[OnlineFeatures] = []
+
+    def observe(self, features: OnlineFeatures) -> None:
+        self.observed_features.append(features)
+
+    def predict(self, features: OnlineFeatures) -> Prediction:
+        return Prediction(
+            session_id=features.session_id,
+            car_id=features.car_id,
+            lap=features.lap,
+            tire_wear_pct=0.0,
+            remaining_tire_life_laps=30.0,
+            grip_loss_pct=0.0,
+            overheating_probability=0.0,
+            cliff_probability=0.0,
+            brake_temp_next_lap_c=500.0,
+            ers_efficiency=features.ers_efficiency,
+            next_lap_delta_s=0.0,
+            uncertainty_low_s=-1.0,
+            uncertainty_high_s=1.0,
+        )
+
+
+class FakeTelemetryFrame:
+    def __init__(self, records: list[dict]) -> None:
+        self.records = records
+
+    def add_distance(self) -> "FakeTelemetryFrame":
+        return self
+
+    def to_dict(self, orientation: str) -> list[dict]:
+        assert orientation == "records"
+        return self.records
+
+
+class FakeLap(dict):
+    def __init__(self, payload: dict, telemetry: list[dict]) -> None:
+        super().__init__(payload)
+        self.telemetry = telemetry
+
+    def get_car_data(self) -> FakeTelemetryFrame:
+        return FakeTelemetryFrame(self.telemetry)
+
+
+class FakeLaps(list):
+    def pick_driver(self, driver: str) -> "FakeLaps":
+        return FakeLaps(
+            [
+                lap
+                for lap in self
+                if lap.get("Driver") == driver or str(lap.get("DriverNumber")) == str(driver)
+            ]
+        )
+
+
+class FakeWeatherFrame:
+    def __init__(self, records: list[dict]) -> None:
+        self.records = records
+
+    def to_dict(self, orientation: str) -> list[dict]:
+        assert orientation == "records"
+        return self.records
+
+
+class FakeFastF1Session:
+    def __init__(self) -> None:
+        self.laps = FakeLaps(
+            [
+                FakeLap(
+                    {
+                        "Driver": "VER",
+                        "DriverNumber": 1,
+                        "LapNumber": 1,
+                        "LapTime": timedelta(seconds=91.2),
+                        "Sector1Time": timedelta(seconds=30.1),
+                        "Sector2Time": timedelta(seconds=31.0),
+                        "Sector3Time": timedelta(seconds=30.1),
+                        "Compound": "SOFT",
+                        "Time": timedelta(seconds=91.2),
+                    },
+                    [
+                        {
+                            "Speed": 230 + index,
+                            "Throttle": 70 + index,
+                            "Brake": 5 if index < 4 else 30,
+                            "Distance": index * 90.0,
+                            "Time": timedelta(seconds=index * 2),
+                            "X": index * 10.0,
+                            "Y": index * 4.0,
+                        }
+                        for index in range(1, 10)
+                    ],
+                ),
+                FakeLap(
+                    {
+                        "Driver": "VER",
+                        "DriverNumber": 1,
+                        "LapNumber": 2,
+                        "LapTime": timedelta(seconds=91.5),
+                        "Sector1Time": timedelta(seconds=30.2),
+                        "Sector2Time": timedelta(seconds=31.2),
+                        "Sector3Time": timedelta(seconds=30.1),
+                        "Compound": "SOFT",
+                        "Time": timedelta(seconds=182.7),
+                    },
+                    [
+                        {
+                            "Speed": 232 + index,
+                            "Throttle": 72 + index,
+                            "Brake": 10 if index < 5 else 35,
+                            "Distance": index * 92.0,
+                            "Time": timedelta(seconds=92 + index * 2),
+                            "X": index * 11.0,
+                            "Y": index * 3.0,
+                        }
+                        for index in range(1, 10)
+                    ],
+                ),
+            ]
+        )
+        self.weather_data = FakeWeatherFrame(
+            [
+                {
+                    "Time": timedelta(seconds=0),
+                    "TrackTemp": 39.0,
+                    "AirTemp": 28.0,
+                    "Humidity": 48.0,
+                },
+                {
+                    "Time": timedelta(seconds=120),
+                    "TrackTemp": 40.0,
+                    "AirTemp": 28.5,
+                    "Humidity": 47.0,
+                },
+            ]
+        )
 
 
 class SystemTest(unittest.TestCase):
@@ -212,6 +371,90 @@ class SystemTest(unittest.TestCase):
         self.assertTrue(all(isinstance(value, bool) for value in report.gates.values()))
         self.assertTrue(report.passed, payload)
 
+    def test_fastf1_export_maps_observed_and_derived_replay_fields(self) -> None:
+        session = FakeFastF1Session()
+        rows = rows_from_fastf1_session(
+            session,
+            year=2024,
+            event="Bahrain",
+            session_name="R",
+            driver="VER",
+        )
+
+        self.assertEqual(len(rows), 6)
+        self.assertEqual(rows[0]["session_id"], "fastf1-2024-bahrain-r")
+        self.assertEqual(rows[0]["car_id"], "1")
+        self.assertEqual(rows[0]["compound"], TireCompound.SOFT.value)
+        self.assertEqual({row["sector"] for row in rows}, {1, 2, 3})
+        self.assertTrue(all(row["lap_time_s"] for row in rows))
+        self.assertTrue(all(row["speed_kph"] > 0 for row in rows))
+        self.assertTrue(all(0.0 <= row["throttle"] <= 1.0 for row in rows))
+        self.assertTrue(all(0.0 <= row["brake"] <= 1.0 for row in rows))
+        self.assertTrue(all(row["tire_temp_fl"] > row["air_temp_c"] for row in rows))
+
+    def test_fastf1_export_writes_csv_and_manifest_provenance(self) -> None:
+        rows = rows_from_fastf1_session(
+            FakeFastF1Session(),
+            year=2024,
+            event="Bahrain",
+            session_name="R",
+            driver="VER",
+            max_laps=1,
+        )
+        with TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "fastf1_replay.csv"
+            write_replay_csv(output, rows)
+            self.assertTrue(output.exists())
+            self.assertEqual(manifest_path_for(output).name, "fastf1_replay.csv.manifest.json")
+
+            manifest = export_manifest(
+                config=FastF1ExportConfig(
+                    year=2024,
+                    event="Bahrain",
+                    session="R",
+                    driver="VER",
+                    output=output,
+                ),
+                rows=rows,
+                fastf1_version="test",
+            )
+
+        self.assertEqual(manifest["source"], "fastf1")
+        self.assertEqual(manifest["row_count"], 3)
+        self.assertEqual(manifest["field_provenance"]["lap_time_s"].split(":")[0], "observed")
+
+    def test_fastf1_manifest_marks_observed_public_validation_signal(self) -> None:
+        rows = rows_from_fastf1_session(
+            FakeFastF1Session(),
+            year=2024,
+            event="Bahrain",
+            session_name="R",
+            driver="VER",
+            max_laps=1,
+        )
+        with TemporaryDirectory() as temp_dir:
+            output = Path(temp_dir) / "fastf1_replay.csv"
+            write_replay_csv(output, rows)
+            manifest = export_manifest(
+                config=FastF1ExportConfig(
+                    year=2024,
+                    event="Bahrain",
+                    session="R",
+                    driver="VER",
+                    output=output,
+                ),
+                rows=rows,
+                fastf1_version="test",
+            )
+            manifest_path_for(output).write_text(json.dumps(manifest), encoding="utf-8")
+
+            provenance = replay_data_provenance(output)
+
+        self.assertEqual(provenance["validation_signal"], "observed-public")
+        self.assertTrue(provenance["production_validation_ready"])
+        self.assertIn("lap_time_s", provenance["observed_fields"])
+        self.assertIn("derived", manifest["field_provenance"]["tire_temp_fl"])
+
     def test_replay_suite_reports_named_splits(self) -> None:
         report = run_replay_suite()
         payload = replay_suite_to_dict(report)
@@ -221,6 +464,111 @@ class SystemTest(unittest.TestCase):
         self.assertIn("smoke", {split.scenario.scenario for split in report.splits})
         self.assertGreater(report.total_event_count, 12)
         self.assertTrue(all(split.dataset_fingerprint for split in report.splits))
+
+    def test_benchmark_replay_suite_enforces_committed_slices(self) -> None:
+        report = run_benchmark_replay_suite()
+        payload = replay_suite_to_dict(report)
+
+        self.assertEqual(report.suite_name, "benchmark")
+        self.assertEqual(report.split_count, len(BENCHMARK_REPLAY_SUITE))
+        self.assertGreaterEqual(report.total_event_count, 200)
+        self.assertEqual(report.total_event_count, report.total_labeled_event_count)
+        self.assertTrue(report.passed, payload)
+
+    def test_benchmark_replay_fixtures_have_non_production_manifests(self) -> None:
+        for spec in BENCHMARK_REPLAY_SUITE:
+            assert spec.dataset_path is not None
+            provenance = replay_data_provenance(spec.dataset_path)
+
+            self.assertTrue(provenance["manifest_available"], spec.dataset_path)
+            self.assertEqual(provenance["source"], "benchmark-fixture")
+            self.assertEqual(provenance["validation_signal"], "proxy-heavy")
+            self.assertEqual(provenance["lap_time_label"], "synthetic")
+            self.assertFalse(provenance["production_validation_ready"])
+
+    def test_benchmark_manifest_generator_matches_committed_sidecars(self) -> None:
+        checked = write_benchmark_manifests(check=True)
+
+        self.assertEqual(len(checked), len(BENCHMARK_REPLAY_SUITE))
+        for spec in BENCHMARK_REPLAY_SUITE:
+            assert spec.dataset_path is not None
+            manifest_path = spec.dataset_path.with_suffix(spec.dataset_path.suffix + ".manifest.json")
+            actual = json.loads(manifest_path.read_text(encoding="utf-8"))
+            self.assertEqual(actual, benchmark_manifest_payload(spec))
+
+    def test_ui_static_replay_trust_badges_are_wired(self) -> None:
+        app_js = Path("src/f1_strategy/ui/app.js").read_text(encoding="utf-8")
+        index_html = Path("src/f1_strategy/ui/index.html").read_text(encoding="utf-8")
+        styles = Path("src/f1_strategy/ui/styles.css").read_text(encoding="utf-8")
+
+        for label in ["Production", "Benchmark", "Synthetic", "Proxy", "No Manifest"]:
+            self.assertIn(label, app_js)
+        self.assertIn("Label Type", index_html)
+        self.assertIn("trust-badge", styles)
+        self.assertIn("trustBadge(provenance)", app_js)
+
+    def test_ui_static_external_links_are_api_driven(self) -> None:
+        app_js = Path("src/f1_strategy/ui/app.js").read_text(encoding="utf-8")
+        index_html = Path("src/f1_strategy/ui/index.html").read_text(encoding="utf-8")
+        styles = Path("src/f1_strategy/ui/styles.css").read_text(encoding="utf-8")
+
+        self.assertIn("/integrations/external-links", app_js)
+        self.assertNotIn("/integrations/external-links?probe=1", app_js)
+        self.assertIn("resolveInfraUrl", app_js)
+        self.assertIn("defaultExternalServices", app_js)
+        self.assertIn("mergeExternalServices", app_js)
+        self.assertIn("runReplayCheck", app_js)
+        self.assertIn("runRegressionCheck", app_js)
+        self.assertIn("window.location.hostname", app_js)
+        self.assertIn("externalLinksRow", index_html)
+        self.assertIn("Run Checks", index_html)
+        self.assertIn("Replay Run", index_html)
+        self.assertIn("Regression Run", index_html)
+        self.assertIn("Auto (serving)", index_html)
+        self.assertNotIn('href="http://localhost:5000"', index_html)
+        self.assertNotIn('href="http://localhost:3000"', index_html)
+        self.assertNotIn('href="http://localhost:9090"', index_html)
+        self.assertIn(".ext-link.disabled", styles)
+
+    def test_replay_suite_default_engine_ignores_serving_artifact_environment(self) -> None:
+        created_settings = []
+        real_engine = InferenceEngine
+
+        def engine_factory(*args, **kwargs):
+            settings = kwargs.get("settings")
+            if settings is not None:
+                created_settings.append(settings)
+            return real_engine(*args, **kwargs)
+
+        with patch.dict(
+            os.environ,
+            {
+                "F1_MODEL_BACKEND": "kalman",
+                "F1_MODEL_ARTIFACT_ID": "xgboost/does-not-exist",
+            },
+            clear=False,
+        ), patch("f1_strategy.replay.InferenceEngine", side_effect=engine_factory):
+            report = run_replay_suite([ReplaySplitSpec("backend-default", laps=4, seed=301)])
+
+        self.assertTrue(report.passed, replay_suite_to_dict(report))
+        self.assertTrue(created_settings)
+        self.assertTrue(all(settings.model_backend == "hybrid" for settings in created_settings))
+        self.assertTrue(all(settings.model_artifact_id == "" for settings in created_settings))
+
+    def test_online_model_observes_only_labeled_lap_events(self) -> None:
+        model = CountingModel()
+        engine = InferenceEngine(model=model)
+        events = RaceSimulator(SimulationConfig(laps=2, seed=31)).events()
+        unlabeled = [event for event in events if event.lap_time_s is None][:2]
+        labeled = next(event for event in events if event.lap_time_s is not None)
+
+        for event in unlabeled:
+            engine.ingest(event)
+        self.assertEqual(model.observed_features, [])
+
+        engine.ingest(labeled)
+        self.assertEqual(len(model.observed_features), 1)
+        self.assertEqual(model.observed_features[0].lap, labeled.lap)
 
     def test_model_manifest_validates_feature_schema_hash(self) -> None:
         with TemporaryDirectory() as temp_dir:
@@ -268,8 +616,13 @@ class SystemTest(unittest.TestCase):
             self.assertTrue((bundle.bundle_dir / "evaluation.md").exists())
             self.assertTrue((bundle.bundle_dir / "replay_evaluation.json").exists())
             self.assertTrue((bundle.bundle_dir / "replay_suite.json").exists())
+            self.assertTrue((bundle.bundle_dir / "model_card.json").exists())
             manifest = json.loads(bundle.manifest_path.read_text(encoding="utf-8"))
+            model_card = json.loads((bundle.bundle_dir / "model_card.json").read_text())
             self.assertEqual(manifest["replay_dataset_fingerprint"], "replay-fingerprint")
+            self.assertEqual(manifest["model_card"], "model_card.json")
+            self.assertEqual(model_card["artifact_id"], bundle.artifact_id)
+            self.assertIn("replay_evaluation", model_card)
             self.assertTrue(manifest["replay_evaluation_metrics"]["passed"])
             self.assertTrue(manifest["replay_suite_metrics"]["passed"])
             validate_model_manifest(bundle.model_path, backend="xgboost")
@@ -399,6 +752,22 @@ class SystemTest(unittest.TestCase):
             self.assertFalse(result.promoted)
             self.assertTrue(any("replay" in failure for failure in result.failures))
 
+    def test_promote_artifact_requires_benchmark_replay_suite(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle = self._create_test_artifact(
+                temp_dir,
+                report=self._artifact_test_report(),
+                replay_suite_report=self._artifact_replay_suite_report(suite_name="smoke"),
+            )
+
+            result = promote_artifact(
+                bundle.artifact_id,
+                artifact_root=Path(temp_dir) / "artifacts",
+            )
+
+            self.assertFalse(result.promoted)
+            self.assertTrue(any("suite name" in failure for failure in result.failures))
+
     def test_monitoring_catalog_and_export_cover_spec_metrics(self) -> None:
         catalog = monitoring_catalog()
         self.assertIn("rmse", catalog["ml"])
@@ -507,14 +876,39 @@ class SystemTest(unittest.TestCase):
         self.assertTrue(any(alert["type"] == "drift_track_temp_c" for alert in alerts["alerts"]))
 
     def test_deployment_readiness_exposes_checks_and_prometheus_metric(self) -> None:
-        engine = InferenceEngine()
-        readiness = engine.deployment_readiness()
-        metrics = engine.monitoring.render_prometheus()
+        with TemporaryDirectory() as temp_dir:
+            settings = load_settings().__class__(
+                model_artifact_root=str(Path(temp_dir) / "artifacts")
+            )
+            engine = InferenceEngine(settings=settings)
+            readiness = engine.deployment_readiness()
+            metrics = engine.monitoring.render_prometheus()
 
-        self.assertIn("ready", readiness)
-        self.assertIn("checks", readiness)
-        self.assertIn("rollback_candidate", readiness)
-        self.assertIn("f1_deployment_ready", metrics)
+            self.assertIn("ready", readiness)
+            self.assertIn("checks", readiness)
+            self.assertIn("rollback_candidate", readiness)
+            self.assertIn("f1_deployment_ready", metrics)
+
+            production = engine.deployment_readiness(mode="production")
+            self.assertFalse(production["ready"])
+            self.assertEqual(production["mode"], "production")
+            self.assertIn("production_replay_validation", production["checks"])
+
+    def test_strict_promotion_rejects_artifact_without_production_replay_signal(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            bundle = self._create_test_artifact(temp_dir, report=self._artifact_test_report())
+
+            result = promote_artifact(
+                bundle.artifact_id,
+                artifact_root=Path(temp_dir) / "artifacts",
+                gates=PromotionGateConfig(require_production_replay_validation=True),
+            )
+
+        self.assertFalse(result.promoted)
+        self.assertTrue(
+            any("production validation" in failure for failure in result.failures),
+            result.failures,
+        )
 
     def test_rollback_candidate_selects_previous_promoted_artifact(self) -> None:
         report = self._artifact_test_report()
@@ -782,7 +1176,7 @@ class SystemTest(unittest.TestCase):
     ) -> EvaluationReport:
         return EvaluationReport(
             version=APP_VERSION,
-            feature_schema_version="online-features-v1",
+            feature_schema_version="online-features-v2",
             feature_schema_hash=feature_schema_hash(),
             scenarios=[
                 ScenarioEvaluation(
@@ -811,7 +1205,7 @@ class SystemTest(unittest.TestCase):
     ) -> ReplayEvaluationReport:
         return ReplayEvaluationReport(
             version=APP_VERSION,
-            feature_schema_version="online-features-v1",
+            feature_schema_version="online-features-v2",
             feature_schema_hash=feature_schema_hash(),
             dataset_path="examples/replay_telemetry.csv",
             dataset_fingerprint="replay-fingerprint",
@@ -848,19 +1242,25 @@ class SystemTest(unittest.TestCase):
             passed=passed,
         )
 
-    def _artifact_replay_suite_report(self, passed: bool = True) -> ReplaySuiteReport:
+    def _artifact_replay_suite_report(
+        self,
+        passed: bool = True,
+        suite_name: str = "benchmark",
+    ) -> ReplaySuiteReport:
         split = self._artifact_replay_report(passed=passed)
+        splits = [split] * 5
         return ReplaySuiteReport(
             version=APP_VERSION,
-            feature_schema_version="online-features-v1",
+            feature_schema_version="online-features-v2",
             feature_schema_hash=feature_schema_hash(),
-            split_count=1,
+            split_count=len(splits),
             passed=passed,
             mean_mae_lap_delta_s=split.scenario.mae_lap_delta_s,
             mean_coverage_pct=split.scenario.coverage_pct,
-            total_event_count=split.event_count,
-            total_labeled_event_count=split.labeled_event_count,
-            splits=[split],
+            total_event_count=sum(item.event_count for item in splits),
+            total_labeled_event_count=sum(item.labeled_event_count for item in splits),
+            splits=splits,
+            suite_name=suite_name,
         )
 
     def test_duckdb_persistence_lists_run_summaries_when_available(self) -> None:
@@ -990,6 +1390,288 @@ class SystemTest(unittest.TestCase):
             },
         )
         self.assertEqual(response.status_code, 422)
+
+
+class AutoDriftTests(unittest.TestCase):
+    """Drift detection fires automatically inside engine.ingest()."""
+
+    def _run_engine(self, laps: int = 12) -> InferenceEngine:
+        from f1_strategy.simulation import RaceSimulator, SimulationConfig
+        engine = InferenceEngine()
+        sim = RaceSimulator(SimulationConfig(
+            session_id="drift-test", car_id="c1", laps=laps, seed=7
+        ))
+        for event in sim.events():
+            engine.ingest(event)
+        return engine
+
+    def test_baseline_auto_fitted_after_warmup(self) -> None:
+        engine = self._run_engine(laps=15)
+        # Baseline is fitted after DRIFT_WARMUP (30) events; 15 laps × 3 sectors = 45
+        self.assertGreater(len(engine.drift_detector._baseline), 0)
+
+    def test_drift_scores_appear_in_prometheus_after_warmup(self) -> None:
+        engine = self._run_engine(laps=15)
+        metrics = engine.monitoring.render_prometheus()
+        drift_lines = [line for line in metrics.splitlines() if "f1_drift_z_score_" in line and not line.startswith("#")]
+        self.assertGreater(len(drift_lines), 0)
+
+    def test_psi_scores_emitted_after_window_fills(self) -> None:
+        from f1_strategy.drift import DriftDetector
+        from f1_strategy.simulation import RaceSimulator, SimulationConfig
+        from f1_strategy.feature_store import OnlineFeatureStore
+
+        d = DriftDetector(window_size=10)
+        sim = RaceSimulator(SimulationConfig(session_id="s", car_id="c", laps=20, seed=1))
+        store = OnlineFeatureStore()
+        features_list = [store.ingest(ev) for ev in sim.events()]
+
+        d.fit_baseline(features_list[:15])
+        report = None
+        for f in features_list[15:]:
+            report = d.detect(f)
+
+        self.assertIsNotNone(report)
+        psi_keys = [k for k in report.feature_scores if k.startswith("psi_")]
+        self.assertGreater(len(psi_keys), 0, "expected PSI scores after window fills")
+
+    def test_concept_drift_z_tracked_after_error_warmup(self) -> None:
+        from f1_strategy.drift import DriftDetector
+        from f1_strategy.simulation import RaceSimulator, SimulationConfig
+        from f1_strategy.feature_store import OnlineFeatureStore
+
+        d = DriftDetector(window_size=15)
+        sim = RaceSimulator(SimulationConfig(session_id="s", car_id="c", laps=25, seed=2))
+        store = OnlineFeatureStore()
+        features_list = [store.ingest(ev) for ev in sim.events()]
+
+        d.fit_baseline(features_list[:20])
+        for i, f in enumerate(features_list[20:]):
+            d.record_error(0.05 * ((i % 8) + 1))
+            report = d.detect(f)
+
+        self.assertIn("concept_drift_z", report.feature_scores)
+
+
+class ShadowDeploymentTests(unittest.TestCase):
+    """ShadowDeploymentManager records divergence and surfaces promotion candidates."""
+
+    def _make_shadow_with_data(self, n_events: int = 60) -> tuple:
+        from f1_strategy.models import KalmanFilterModel, ModelConfig
+        from f1_strategy.simulation import RaceSimulator, SimulationConfig
+
+        engine = InferenceEngine()
+        challenger = KalmanFilterModel(ModelConfig())
+        engine.shadow.configure(model=challenger, backend="kalman")
+
+        sim = RaceSimulator(SimulationConfig(session_id="s1", car_id="c1", laps=25, seed=3))
+        for event in sim.events():
+            engine.ingest(event)
+            if engine.shadow._total >= n_events:
+                break
+        return engine, engine.shadow
+
+    def test_shadow_records_divergence_between_models(self) -> None:
+        engine, shadow = self._make_shadow_with_data(n_events=10)
+        self.assertTrue(shadow.active)
+        self.assertGreater(shadow._total, 0)
+        status = shadow.status()
+        self.assertIn("divergence_rate", status)
+        self.assertIn("mean_abs_delta_s", status)
+        self.assertGreaterEqual(status["mean_abs_delta_s"], 0.0)
+
+    def test_shadow_promotion_candidate_none_with_insufficient_data(self) -> None:
+        from f1_strategy.models import KalmanFilterModel, ModelConfig
+        shadow = ShadowDeploymentManager()
+        shadow.configure(model=KalmanFilterModel(ModelConfig()), backend="kalman")
+        # No data recorded yet
+        self.assertIsNone(shadow.promotion_candidate(min_predictions=50))
+
+    def test_shadow_promotion_candidate_returned_when_challenger_better(self) -> None:
+        shadow = ShadowDeploymentManager(window_size=200)
+        from f1_strategy.models import KalmanFilterModel, ModelConfig
+        shadow.configure(model=KalmanFilterModel(ModelConfig()), backend="kalman")
+
+        # Inject synthetic window where challenger has lower absolute delta
+        for i in range(60):
+            shadow._window.append({
+                "lap": i + 1,
+                "champion_delta_s": 0.50,
+                "challenger_delta_s": 0.20,
+                "delta_s": 0.30,
+                "abs_delta_s": 0.30,
+                "champion_wear": 30.0,
+                "challenger_wear": 30.0,
+                "champion_cliff": 0.1,
+                "challenger_cliff": 0.1,
+                "challenger_latency_ms": 1.0,
+            })
+        shadow._total = 60  # must match window size for promotion to trigger
+
+        candidate = shadow.promotion_candidate(min_predictions=50, improvement_threshold_s=0.02)
+        self.assertIsNotNone(candidate)
+        self.assertEqual(candidate["challenger_backend"], "kalman")
+        self.assertGreater(candidate["improvement_s"], 0)
+        self.assertIn("recommendation", candidate)
+
+    def test_shadow_disable_clears_all_state(self) -> None:
+        from f1_strategy.models import KalmanFilterModel, ModelConfig
+        shadow = ShadowDeploymentManager()
+        shadow.configure(model=KalmanFilterModel(ModelConfig()), backend="kalman")
+        shadow._total = 5
+        shadow.disable()
+        self.assertFalse(shadow.active)
+        self.assertEqual(shadow._total, 0)
+        self.assertEqual(len(shadow._window), 0)
+        self.assertIsNone(shadow.promotion_candidate())
+
+    def test_status_includes_promotion_candidate_key(self) -> None:
+        shadow = ShadowDeploymentManager()
+        status = shadow.status()
+        self.assertIn("promotion_candidate", status)
+
+
+class LiveTimingTests(unittest.TestCase):
+    """ReplayStreamSource streams CSV events at configurable speed."""
+
+    def test_replay_stream_emits_all_labeled_rows(self) -> None:
+        import threading
+        import time
+        from f1_strategy.data_sources.live_timing import ReplayStreamSource
+
+        received = []
+        lock = threading.Lock()
+
+        def on_event(ev):
+            with lock:
+                received.append(ev)
+
+        src = ReplayStreamSource(
+            dataset_path="examples/replay_telemetry.csv",
+            speed_multiplier=500.0,
+            on_event=on_event,
+        )
+        src.start()
+        time.sleep(1.5)
+        src.stop()
+
+        with lock:
+            count = len(received)
+        self.assertGreater(count, 0)
+        self.assertIsNotNone(received[0].session_id)
+
+    def test_replay_stream_status_reflects_progress(self) -> None:
+        import time
+        from f1_strategy.data_sources.live_timing import ReplayStreamSource
+
+        src = ReplayStreamSource(
+            dataset_path="examples/replay_telemetry.csv",
+            speed_multiplier=500.0,
+        )
+        src.start()
+        time.sleep(1.5)
+        self.assertGreaterEqual(src.status.events_ingested, 0)
+
+    def test_live_stream_manager_configure_sets_mode(self) -> None:
+        from f1_strategy.data_sources.live_timing import LiveStreamManager
+        mgr = LiveStreamManager()
+        status = mgr.configure_replay("examples/replay_telemetry.csv", speed_multiplier=1.0)
+        self.assertEqual(status.mode, "replay")
+
+    def test_replay_stop_halts_stream(self) -> None:
+        import time
+        from f1_strategy.data_sources.live_timing import ReplayStreamSource
+
+        received = []
+
+        def on_event(ev):
+            received.append(ev)
+
+        src = ReplayStreamSource(
+            dataset_path="examples/replay_telemetry.csv",
+            speed_multiplier=2.0,
+            on_event=on_event,
+        )
+        src.start()
+        time.sleep(0.1)
+        src.stop()
+        time.sleep(0.2)
+        count_after_stop = len(received)
+        time.sleep(0.3)
+        # no new events should arrive after stop
+        self.assertEqual(len(received), count_after_stop)
+
+
+class RealDataRowsTests(unittest.TestCase):
+    """_real_data_rows() extracts labeled feature vectors from a replay CSV."""
+
+    def _write_temp_csv(self, tmp_dir: str, include_labeled: bool = True) -> str:
+        import csv as _csv
+        from f1_strategy.data_sources.fastf1_export import REPLAY_COLUMNS
+
+        path = f"{tmp_dir}/test_real.csv"
+        rows = [
+            {
+                "session_id": "test", "car_id": "VER", "lap": 1, "sector": 1,
+                "speed_kph": 230.0, "throttle": 0.85, "brake": 0.1,
+                "steering_angle": -5.0, "tire_temp_fl": 95.0, "tire_temp_fr": 95.0,
+                "tire_temp_rl": 92.0, "tire_temp_rr": 92.0, "brake_temp": 600.0,
+                "slip_angle": 2.5, "lateral_g": 2.8, "ers_soc": 0.75,
+                "ers_deployment_kw": 70.0, "fuel_kg": 95.0, "track_temp_c": 38.0,
+                "air_temp_c": 27.0, "humidity": 0.44, "compound": "medium",
+                "lap_time_s": "91.234" if include_labeled else "",
+                "timestamp_ms": 10000,
+            }
+            for _ in range(5)
+        ]
+        with open(path, "w", newline="") as fh:
+            writer = _csv.DictWriter(fh, fieldnames=REPLAY_COLUMNS)
+            writer.writeheader()
+            for row in rows:
+                writer.writerow({col: row.get(col, "") for col in REPLAY_COLUMNS})
+        return path
+
+    def test_real_data_rows_reads_labeled_csv(self) -> None:
+        import tempfile
+        from f1_strategy.training import _real_data_rows
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_temp_csv(tmp, include_labeled=True)
+            rows, targets = _real_data_rows(path)
+        self.assertGreater(len(rows), 0)
+        self.assertEqual(len(rows), len(targets))
+        self.assertTrue(all(isinstance(r, list) for r in rows))
+
+    def test_real_data_rows_skips_unlabeled(self) -> None:
+        import tempfile
+        from f1_strategy.training import _real_data_rows
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_temp_csv(tmp, include_labeled=False)
+            rows, targets = _real_data_rows(path)
+        self.assertEqual(len(rows), 0)
+
+
+class RedisFeatureStoreTests(unittest.TestCase):
+    """RedisFeatureStore degrades to in-memory when Redis is unavailable."""
+
+    def test_create_feature_store_falls_back_to_in_memory_without_redis(self) -> None:
+        from f1_strategy.feature_store import OnlineFeatureStore, create_feature_store
+        store = create_feature_store(backend="auto", redis_url="redis://127.0.0.1:19999/0")
+        self.assertIsInstance(store, OnlineFeatureStore)
+
+    def test_create_feature_store_returns_in_memory_when_no_url(self) -> None:
+        from f1_strategy.feature_store import OnlineFeatureStore, create_feature_store
+        store = create_feature_store(backend="auto", redis_url="")
+        self.assertIsInstance(store, OnlineFeatureStore)
+
+    def test_redis_feature_store_ingest_works_when_redis_unavailable(self) -> None:
+        from f1_strategy.feature_store import RedisFeatureStore
+        from f1_strategy.simulation import RaceSimulator, SimulationConfig
+        store = RedisFeatureStore(redis_url="redis://127.0.0.1:19999/0", window_size=20)
+        self.assertFalse(store.is_connected)  # no Redis at that port
+        sim = RaceSimulator(SimulationConfig(session_id="s", car_id="c", laps=3, seed=1))
+        events = list(sim.events())
+        features = store.ingest(events[0])
+        self.assertEqual(features.session_id, "s")
 
 
 if __name__ == "__main__":

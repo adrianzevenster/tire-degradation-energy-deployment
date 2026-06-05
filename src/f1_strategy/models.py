@@ -6,7 +6,7 @@ from collections import deque
 from dataclasses import dataclass
 from math import exp, sqrt
 from pathlib import Path
-from statistics import mean, pstdev
+from statistics import mean
 from typing import Protocol
 
 from f1_strategy.domain import OnlineFeatures, Prediction, TireCompound
@@ -28,8 +28,44 @@ COMPOUND_PACE = {
     TireCompound.WET: 3.0,
 }
 
+def _circuit_enc(typical_lap_s: float, base: float = 90.0, scale: float = 15.0) -> float:
+    return round((typical_lap_s - base) / scale, 3)
+
+
+# Scaled lap delta from 90s base: (typical_race_lap_s - 90) / 15
+# Creates a monotonic encoding so XGBoost needs fewer splits to learn circuit offsets.
+CIRCUIT_ENCODING: dict[str, float] = {
+    "synthetic":   _circuit_enc(90),    #  0.000
+    "monaco":      _circuit_enc(78.4),  # -0.773
+    "imola":       _circuit_enc(82.0),  # -0.533
+    "monza":       _circuit_enc(84.3),  # -0.380
+    "australia":   _circuit_enc(84.5),  # -0.367
+    "spa":         _circuit_enc(88.5),  # -0.100
+    "zandvoort":   _circuit_enc(89.5),  # -0.033
+    "canada":      _circuit_enc(90.5),  #  0.033
+    "saudi-arabia":_circuit_enc(91.5),  #  0.100
+    "miami":       _circuit_enc(92.0),  #  0.133
+    "usa":         _circuit_enc(93.0),  #  0.200
+    "japan":       _circuit_enc(93.5),  #  0.233
+    "spain":       _circuit_enc(94.0),  #  0.267
+    "silverstone": _circuit_enc(94.2),  #  0.280
+    "austria":     _circuit_enc(94.5),  #  0.300
+    "baku":        _circuit_enc(95.0),  #  0.333
+    "bahrain":     _circuit_enc(95.8),  #  0.387
+    "china":       _circuit_enc(96.0),  #  0.400
+    "abu-dhabi":   _circuit_enc(96.0),  #  0.400
+    "brazil":      _circuit_enc(97.0),  #  0.467
+    "singapore":   _circuit_enc(97.4),  #  0.493
+    "las-vegas":   _circuit_enc(97.5),  #  0.500
+    "mexico":      _circuit_enc(98.5),  #  0.567
+    "hungary":     _circuit_enc(99.0),  #  0.600
+    "qatar":       _circuit_enc(100.0), #  0.667
+}
+
 FEATURE_NAMES = [
     "bias",
+    "circuit",
+    "rolling_lap_time_s",
     "tire_age_laps",
     "mean_tire_temp",
     "tire_temp_gradient",
@@ -43,10 +79,11 @@ FEATURE_NAMES = [
     "track_temp_c",
     "fuel_kg",
     "dirty_air_risk",
+    "circuit_base_lap_s",
     *[f"compound_{compound.value}" for compound in TireCompound],
 ]
 
-FEATURE_SCHEMA_VERSION = "online-features-v1"
+FEATURE_SCHEMA_VERSION = "online-features-v3"
 
 
 def feature_schema_hash(feature_names: list[str] | None = None) -> str:
@@ -161,6 +198,8 @@ def features_to_vector(features: OnlineFeatures) -> list[float]:
     compound_flags = [1.0 if features.compound == compound else 0.0 for compound in TireCompound]
     return [
         1.0,
+        CIRCUIT_ENCODING.get(features.circuit, 0.0),
+        features.rolling_lap_time_s / 130.0,
         features.tire_age_laps / 45.0,
         features.mean_tire_temp / 125.0,
         features.tire_temp_gradient / 35.0,
@@ -174,6 +213,7 @@ def features_to_vector(features: OnlineFeatures) -> list[float]:
         features.track_temp_c / 65.0,
         features.fuel_kg / 110.0,
         features.dirty_air_risk,
+        features.circuit_base_lap_s / 130.0,
         *compound_flags,
     ]
 
@@ -222,11 +262,27 @@ class HybridOnlineEnsembleModel:
         residual = self._clamp(residual * warmup, -2.5, 2.5)
 
         lap_delta = prior.lap_delta_s + residual
-        ensemble_spread = pstdev(residuals) if len(residuals) > 1 else 0.0
+        if self.observations > 0:
+            observed_delta = features.rolling_lap_time_s - self.config.base_lap_time_s
+            anchor_weight = min(0.92, 0.72 + self.observations / 120.0)
+            lap_delta = observed_delta * anchor_weight + lap_delta * (1.0 - anchor_weight)
+        if len(residuals) > 1:
+            m = mean(residuals)
+            ensemble_spread = (sum((x - m) ** 2 for x in residuals) / len(residuals)) ** 0.5
+        else:
+            ensemble_spread = 0.0
         conformal_error = self._conformal_error()
+        anchor_disagreement = 0.0
+        if self.observations > 0:
+            anchor_disagreement = abs(
+                lap_delta - (features.rolling_lap_time_s - self.config.base_lap_time_s)
+            )
         uncertainty = max(
             0.12,
-            prior.uncertainty_s + 1.35 * ensemble_spread + conformal_error * warmup,
+            prior.uncertainty_s
+            + 1.35 * ensemble_spread
+            + conformal_error * warmup
+            + anchor_disagreement * 0.35,
         )
 
         learned_stress = max(0.0, residual) * 0.7 + ensemble_spread * 0.4
@@ -335,6 +391,7 @@ class HybridOnlineEnsembleModel:
             car_id="car",
             lap=1,
             compound=TireCompound.MEDIUM,
+            circuit="synthetic",
             tire_age_laps=0,
             mean_tire_temp=95.0,
             tire_temp_gradient=2.0,
@@ -349,6 +406,7 @@ class HybridOnlineEnsembleModel:
             fuel_kg=95.0,
             rolling_lap_time_s=90.0,
             dirty_air_risk=0.0,
+            circuit_base_lap_s=90.0,
         )
 
     @staticmethod
@@ -407,7 +465,7 @@ class XGBoostModel:
         raw_prediction = self.booster.inplace_predict(matrix)
         outputs = self._coerce_outputs(raw_prediction)
 
-        lap_delta = self._clamp(outputs[0], -8.0, 8.0)
+        lap_delta = self._clamp(outputs[0], -25.0, 15.0)
         tire_wear_pct = fallback.tire_wear_pct
         cliff_probability = fallback.cliff_probability
         brake_temp_next_lap_c = fallback.brake_temp_next_lap_c
@@ -420,7 +478,7 @@ class XGBoostModel:
 
         fallback_width = fallback.uncertainty_high_s - fallback.uncertainty_low_s
         model_delta_gap = abs(lap_delta - fallback.next_lap_delta_s)
-        uncertainty = max(0.14, fallback_width / 2.0 + model_delta_gap * 0.35)
+        uncertainty = max(0.14, min(2.65, fallback_width / 2.0 + model_delta_gap * 0.15))
         grip_adjustment = max(0.0, lap_delta - fallback.next_lap_delta_s) * 0.6
 
         return Prediction(
@@ -493,7 +551,7 @@ class LightGBMModel:
     def predict(self, features: OnlineFeatures) -> Prediction:
         vector = self._np.asarray([features_to_vector(features)], dtype="float32")
         raw_prediction = self.booster.predict(vector)
-        lap_delta = _clamp(_first_prediction(raw_prediction), -8.0, 8.0)
+        lap_delta = _clamp(_first_prediction(raw_prediction), -25.0, 15.0)
         fallback = self.fallback.predict(features)
         width = (fallback.uncertainty_high_s - fallback.uncertainty_low_s) / 2.0
         return self.fallback.prediction_from_lap_delta(
@@ -530,7 +588,7 @@ class CatBoostModel:
 
     def predict(self, features: OnlineFeatures) -> Prediction:
         raw_prediction = self.model.predict([features_to_vector(features)])
-        lap_delta = _clamp(_first_prediction(raw_prediction), -8.0, 8.0)
+        lap_delta = _clamp(_first_prediction(raw_prediction), -25.0, 15.0)
         fallback = self.fallback.predict(features)
         width = (fallback.uncertainty_high_s - fallback.uncertainty_low_s) / 2.0
         return self.fallback.prediction_from_lap_delta(
@@ -579,7 +637,7 @@ class SequenceTorchModel:
         vector = self._torch.tensor([features_to_vector(features)], dtype=self._torch.float32)
         with self._torch.no_grad():
             raw_prediction = self.model(vector)
-        lap_delta = _clamp(_first_prediction(raw_prediction), -8.0, 8.0)
+        lap_delta = _clamp(_first_prediction(raw_prediction), -25.0, 15.0)
         return self.fallback.prediction_from_lap_delta(features, lap_delta, uncertainty_extra=0.18)
 
 
@@ -599,7 +657,7 @@ class KalmanFilterModel:
         if features.rolling_lap_time_s <= 0:
             return
         key = (features.session_id, features.car_id)
-        measurement = _clamp(features.rolling_lap_time_s - self.config.base_lap_time_s, -8.0, 8.0)
+        measurement = _clamp(features.rolling_lap_time_s - self.config.base_lap_time_s, -25.0, 15.0)
         estimate, variance = self.state_by_car.get(key, (measurement, 1.0))
         predicted_variance = variance + self.process_variance
         gain = predicted_variance / (predicted_variance + self.measurement_variance)
@@ -616,7 +674,7 @@ class KalmanFilterModel:
         blended = 0.62 * estimate + 0.38 * fallback.next_lap_delta_s
         return self.fallback.prediction_from_lap_delta(
             features,
-            _clamp(blended, -8.0, 8.0),
+            _clamp(blended, -25.0, 15.0),
             uncertainty_extra=sqrt(max(variance, 0.0)),
         )
 
@@ -655,7 +713,7 @@ class RiverOnlineModel:
             return fallback
         warmup = min(1.0, self.observations / 24.0)
         blended = (1.0 - warmup) * fallback.next_lap_delta_s + warmup * float(prediction)
-        return self.fallback.prediction_from_lap_delta(features, _clamp(blended, -8.0, 8.0))
+        return self.fallback.prediction_from_lap_delta(features, _clamp(blended, -25.0, 15.0))
 
     @staticmethod
     def _features(features: OnlineFeatures) -> dict[str, float]:

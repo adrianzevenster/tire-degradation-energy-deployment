@@ -1,10 +1,40 @@
 services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mlflow:
+    image: python:3.11-slim
+    working_dir: /mlruns
+    command: >
+      bash -c "pip install -q 'mlflow>=2.12' &&
+               mlflow server --host 0.0.0.0 --port 5000
+               --backend-store-uri sqlite:////mlruns/mlflow.db
+               --default-artifact-root /mlruns/artifacts"
+    volumes:
+      - ./data/mlruns:/mlruns
+    ports:
+      - "5000:5000"
+
   api:
     build: .
     env_file:
       - .env.example
+    environment:
+      F1_REDIS_URL: redis://redis:6379/0
+      F1_FEATURE_STORE_BACKEND: auto
+      F1_MLFLOW_TRACKING_URI: http://mlflow:5000
     ports:
       - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
       interval: 10s

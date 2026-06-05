@@ -1,0 +1,41 @@
+{
+  "source": "benchmark-fixture",
+  "generated_at": "2026-06-05T00:00:00Z",
+  "description": "stable medium tire long-run replay",
+  "output": "examples/replay_benchmarks/medium_long_run.csv",
+  "dataset_fingerprint": "fad10884e516cfa339dc1000592051e581c2b8d2c09f49eb89ad3649f0758c77",
+  "row_count": 54,
+  "lap_count": 18,
+  "session_count": 1,
+  "reference_lap_time_s": 90.0,
+  "field_provenance": {
+    "session_id": "synthetic: deterministic benchmark fixture identifier",
+    "car_id": "synthetic: deterministic benchmark fixture car identifier",
+    "lap": "synthetic: deterministic benchmark fixture lap index",
+    "sector": "synthetic: deterministic benchmark fixture sector index",
+    "speed_kph": "synthetic: deterministic benchmark fixture telemetry",
+    "throttle": "synthetic: deterministic benchmark fixture telemetry",
+    "brake": "synthetic: deterministic benchmark fixture telemetry",
+    "steering_angle": "synthetic: deterministic benchmark fixture telemetry",
+    "tire_temp_fl": "synthetic: deterministic benchmark fixture telemetry",
+    "tire_temp_fr": "synthetic: deterministic benchmark fixture telemetry",
+    "tire_temp_rl": "synthetic: deterministic benchmark fixture telemetry",
+    "tire_temp_rr": "synthetic: deterministic benchmark fixture telemetry",
+    "brake_temp": "synthetic: deterministic benchmark fixture telemetry",
+    "slip_angle": "synthetic: deterministic benchmark fixture telemetry",
+    "lateral_g": "synthetic: deterministic benchmark fixture telemetry",
+    "ers_soc": "synthetic: deterministic benchmark fixture telemetry",
+    "ers_deployment_kw": "synthetic: deterministic benchmark fixture telemetry",
+    "fuel_kg": "synthetic: deterministic benchmark fixture telemetry",
+    "track_temp_c": "synthetic: deterministic benchmark fixture telemetry",
+    "air_temp_c": "synthetic: deterministic benchmark fixture telemetry",
+    "humidity": "synthetic: deterministic benchmark fixture telemetry",
+    "compound": "synthetic: deterministic benchmark fixture compound",
+    "lap_time_s": "synthetic: deterministic benchmark fixture lap-time label",
+    "timestamp_ms": "synthetic: deterministic benchmark fixture timestamp"
+  },
+  "limitations": [
+    "Committed benchmark fixture for deterministic development and promotion smoke gates.",
+    "Not observed public telemetry and not suitable as production replay validation."
+  ]
+}

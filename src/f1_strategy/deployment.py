@@ -23,6 +23,8 @@ class DeploymentReadiness:
     latency_p95_ms: float
     target_latency_ms: float
     rollback_candidate: dict[str, Any] | None
+    mode: str
+    production_validation_ready: bool
     checks: dict[str, bool]
 
     def to_dict(self) -> dict[str, Any]:
@@ -40,6 +42,8 @@ class DeploymentReadiness:
             "latency_p95_ms": self.latency_p95_ms,
             "target_latency_ms": self.target_latency_ms,
             "rollback_candidate": self.rollback_candidate,
+            "mode": self.mode,
+            "production_validation_ready": self.production_validation_ready,
             "checks": self.checks,
         }
 
@@ -52,9 +56,15 @@ def deployment_readiness(
     latency_p95_ms: float,
     target_latency_ms: float,
     persistence_backend: str,
+    mode: str = "local",
 ) -> DeploymentReadiness:
+    selected_mode = mode.strip().lower() or "local"
     registry = load_registry(artifact_root)
     promoted = is_promoted(registry, active_backend, active_artifact_id)
+    production_validation_ready = artifact_production_validation_ready(
+        artifact_root,
+        active_artifact_id,
+    )
     schema_match = active_artifact_id == "unregistered" or artifact_schema_matches(
         artifact_root,
         active_artifact_id,
@@ -72,6 +82,9 @@ def deployment_readiness(
         "persistence_ready": persistence_ready,
         "latency_ready": latency_ready,
     }
+    if selected_mode == "production":
+        checks["promoted_artifact"] = promoted
+        checks["production_replay_validation"] = production_validation_ready
     ready = all(checks.values())
     return DeploymentReadiness(
         ready=ready,
@@ -91,6 +104,8 @@ def deployment_readiness(
             backend=active_backend,
             active_artifact_id=active_artifact_id,
         ),
+        mode=selected_mode,
+        production_validation_ready=production_validation_ready,
         checks=checks,
     )
 
@@ -153,3 +168,17 @@ def artifact_schema_matches(artifact_root: str | Path, artifact_id: str) -> bool
         return False
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     return manifest.get("feature_schema_hash") == feature_schema_hash()
+
+
+def artifact_production_validation_ready(artifact_root: str | Path, artifact_id: str) -> bool:
+    if artifact_id == "unregistered":
+        return False
+    manifest_path = Path(artifact_root) / artifact_id / "manifest.json"
+    if not manifest_path.exists():
+        return False
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    metrics = dict(manifest.get("replay_evaluation_metrics", {}))
+    if metrics.get("production_validation_ready") is True:
+        return True
+    provenance = dict(manifest.get("replay_data_provenance", {}))
+    return provenance.get("production_validation_ready") is True

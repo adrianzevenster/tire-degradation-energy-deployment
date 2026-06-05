@@ -7,18 +7,22 @@ from f1_strategy.config import Settings, load_settings
 from f1_strategy.deployment import deployment_readiness, latest_promoted_artifact, load_registry
 from f1_strategy.domain import DriftReport, Prediction, StrategyRecommendation, TelemetryEvent
 from f1_strategy.drift import DriftDetector
-from f1_strategy.feature_store import OnlineFeatureStore
+from f1_strategy.feature_store import FeatureStore, create_feature_store
 from f1_strategy.metadata import build_info
 from f1_strategy.monitoring import MonitoringService
 from f1_strategy.models import ModelConfig, ServingModel, create_serving_model, feature_schema_hash
 from f1_strategy.optimization import StrategyOptimizer
 from f1_strategy.persistence import PersistenceStore, create_persistence_store
+from f1_strategy.shadow import ShadowDeploymentManager
+
+_DRIFT_WARMUP = 30    # events before baseline is fitted
+_DRIFT_REFIT = 500    # refit interval after warmup
 
 
 class InferenceEngine:
     def __init__(
         self,
-        feature_store: OnlineFeatureStore | None = None,
+        feature_store: FeatureStore | None = None,
         model: ServingModel | None = None,
         optimizer: StrategyOptimizer | None = None,
         drift_detector: DriftDetector | None = None,
@@ -32,8 +36,11 @@ class InferenceEngine:
             base_lap_time_s=self.settings.base_lap_time_s,
             pit_loss_s=self.settings.pit_loss_s,
         )
-        self.feature_store = feature_store or OnlineFeatureStore(
-            window_size=self.settings.feature_window_size
+        self.feature_store: FeatureStore = feature_store or create_feature_store(
+            backend=self.settings.feature_store_backend,
+            redis_url=self.settings.redis_url,
+            window_size=self.settings.feature_window_size,
+            base_lap_time_s=self.settings.base_lap_time_s,
         )
         self.model = model or create_serving_model(
             config=config,
@@ -54,6 +61,10 @@ class InferenceEngine:
         )
         self.latency_ms: list[float] = []
         self.build_info = build_info()
+        self.shadow = ShadowDeploymentManager()
+        self._ingest_count: int = 0
+        # (session_id, car_id) → (compound, max_tire_wear_pct_this_stint)
+        self._stint_wear_floor: dict[tuple[str, str], tuple[str, float]] = {}
 
     @staticmethod
     def _resolve_startup_settings(settings: Settings, model: ServingModel | None) -> Settings:
@@ -70,16 +81,22 @@ class InferenceEngine:
     def ingest(self, event: TelemetryEvent) -> Prediction:
         start = perf_counter()
         features = self.feature_store.ingest(event)
-        self.model.observe(features)
+        if event.lap_time_s is not None:
+            self.model.observe(features)
         prediction = self._annotate_prediction(self.model.predict(features))
+        prediction = self._apply_wear_floor(event, prediction)
         latency = (perf_counter() - start) * 1000.0
         self.latency_ms.append(latency)
+        self._ingest_count += 1
+        self._maybe_fit_drift_baseline()
+        self._auto_detect_drift(features)
         self.monitoring.record_prediction(prediction, latency)
         self.persistence.record_telemetry(event)
         self.persistence.record_features(features)
         self.persistence.record_prediction(prediction, latency)
         if event.lap_time_s is not None:
             self._record_observed_lap(event, prediction)
+        self.shadow.observe(features, prediction)
         return prediction
 
     def predict(self, session_id: str, car_id: str) -> Prediction:
@@ -162,7 +179,7 @@ class InferenceEngine:
             latency_p95_ms=self.latency_p95_ms(),
         )
 
-    def deployment_readiness(self) -> dict:
+    def deployment_readiness(self, mode: str = "local") -> dict:
         readiness = deployment_readiness(
             active_backend=self._active_model_backend(),
             active_artifact_id=self._active_model_artifact_id(),
@@ -171,6 +188,7 @@ class InferenceEngine:
             latency_p95_ms=self.latency_p95_ms(),
             target_latency_ms=self.settings.target_latency_ms,
             persistence_backend=getattr(self.persistence, "backend_name", "unknown"),
+            mode=mode,
         )
         self.monitoring.record_deployment_readiness(
             readiness.active_backend,
@@ -189,6 +207,24 @@ class InferenceEngine:
             build_sha=self.build_info.build_sha,
         )
 
+    def _apply_wear_floor(self, event: TelemetryEvent, prediction: Prediction) -> Prediction:
+        """Clamp tire_wear_pct to be non-decreasing within each stint.
+
+        Tires can only accumulate wear; a drop between consecutive laps is a
+        model artefact. We track the per-car max wear and reset it on compound
+        change (pit stop).
+        """
+        key = (event.session_id, event.car_id)
+        compound = event.compound.value if hasattr(event.compound, "value") else str(event.compound)
+        prev_compound, floor = self._stint_wear_floor.get(key, (compound, 0.0))
+        if compound != prev_compound:
+            floor = 0.0
+        clamped = max(prediction.tire_wear_pct, floor)
+        self._stint_wear_floor[key] = (compound, clamped)
+        if clamped == prediction.tire_wear_pct:
+            return prediction
+        return replace(prediction, tire_wear_pct=clamped)
+
     def _active_model_backend(self) -> str:
         return getattr(self.model, "backend_name", self.model.__class__.__name__)
 
@@ -196,7 +232,30 @@ class InferenceEngine:
         artifact_id = getattr(self.model, "artifact_id", "") or self.settings.model_artifact_id
         return artifact_id or "unregistered"
 
+    def _maybe_fit_drift_baseline(self) -> None:
+        if self._ingest_count == _DRIFT_WARMUP or (
+            self._ingest_count > _DRIFT_WARMUP
+            and self._ingest_count % _DRIFT_REFIT == 0
+        ):
+            snapshots = self.feature_store.snapshot()
+            if snapshots:
+                self.drift_detector.fit_baseline(snapshots)
+
+    def _auto_detect_drift(self, features: object) -> None:
+        if self._ingest_count < _DRIFT_WARMUP:
+            return
+        from f1_strategy.domain import OnlineFeatures
+        if not isinstance(features, OnlineFeatures):
+            return
+        report = self.drift_detector.detect(features)
+        self.monitoring.record_drift(
+            report,
+            model_backend=self._active_model_backend(),
+            model_artifact_id=self._active_model_artifact_id(),
+        )
+
     def _record_observed_lap(self, event: TelemetryEvent, prediction: Prediction) -> None:
+        assert event.lap_time_s is not None
         actual_lap_delta_s = event.lap_time_s - self.settings.base_lap_time_s
         self.monitoring.record_evaluation(
             actual_lap_delta_s=actual_lap_delta_s,
@@ -207,4 +266,7 @@ class InferenceEngine:
             car_id=event.car_id,
             actual_lap_delta_s=actual_lap_delta_s,
             prediction=prediction,
+        )
+        self.drift_detector.record_error(
+            abs(actual_lap_delta_s - prediction.next_lap_delta_s)
         )

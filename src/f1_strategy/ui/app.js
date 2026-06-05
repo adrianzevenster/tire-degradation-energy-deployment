@@ -9,6 +9,12 @@ const state = {
   comparison: [],
   replayEvaluation: null,
   replaySuite: null,
+  replayBenchmark: null,
+  replayRun: null,
+  regressionRun: null,
+  replayDatasets: [],
+  selectedReplayDataset: "examples/replay_telemetry.csv",
+  datasetManifest: null,
   artifacts: [],
   artifactRegistry: { promoted: {}, active_artifact_id: "unregistered" },
   selectedArtifactId: null,
@@ -19,6 +25,16 @@ const state = {
   selectedRunId: null,
   historySortKey: "updated_at_ms",
   historySortDirection: "desc",
+  shadow: null,
+  health: null,
+  liveMode: "replay",        // "replay" | "live"
+  liveStatus: null,
+  livePredictions: [],
+  liveTimer: null,
+  trainingJobs: [],
+  activeTrainingJobId: null,
+  trainingPollTimer: null,
+  externalLinks: [],
 };
 
 const el = (id) => document.getElementById(id);
@@ -31,6 +47,33 @@ function pct(value) {
 function num(value, digits = 2) {
   if (!Number.isFinite(value)) return "-";
   return Number(value).toFixed(digits);
+}
+
+function replayTrust(provenance = {}) {
+  const signal = provenance.validation_signal || "-";
+  const source = provenance.source || "";
+  const label = provenance.lap_time_label || "-";
+  if (provenance.production_validation_ready === true) {
+    return { label: "Production", className: "trust-production", title: "Observed public lap-time validation" };
+  }
+  if (source === "benchmark-fixture") {
+    return { label: "Benchmark", className: "trust-benchmark", title: "Manifested benchmark fixture, not production validation" };
+  }
+  if (signal === "synthetic" || label === "synthetic") {
+    return { label: "Synthetic", className: "trust-synthetic", title: "Simulator or synthetic fixture" };
+  }
+  if (signal === "unprovenanced") {
+    return { label: "No Manifest", className: "trust-missing", title: "No sidecar provenance manifest" };
+  }
+  if (signal === "proxy-heavy") {
+    return { label: "Proxy", className: "trust-proxy", title: "Manifested data with proxy-heavy validation fields" };
+  }
+  return { label: signal, className: "trust-unknown", title: signal };
+}
+
+function trustBadge(provenance = {}) {
+  const trust = replayTrust(provenance);
+  return `<span class="trust-badge ${trust.className}" title="${trust.title}">${trust.label}</span>`;
 }
 
 function parseMetrics(text) {
@@ -56,6 +99,105 @@ async function api(path, options = {}) {
   }
   const type = response.headers.get("content-type") || "";
   return type.includes("application/json") ? response.json() : response.text();
+}
+
+function serializeUrl(url) {
+  const path = url.pathname === "/" ? "" : url.pathname;
+  return `${url.protocol}//${url.host}${path}${url.search}${url.hash}`;
+}
+
+function resolveInfraUrl(rawUrl) {
+  if (!rawUrl) return "";
+  try {
+    const url = new URL(rawUrl, window.location.origin);
+    const loopbackHosts = new Set([
+      "localhost",
+      "127.0.0.1",
+      "0.0.0.0",
+      "::1",
+      "mlflow",
+      "grafana",
+      "prometheus",
+    ]);
+    if (loopbackHosts.has(url.hostname)) {
+      url.hostname = window.location.hostname;
+    }
+    return serializeUrl(url);
+  } catch (_error) {
+    return rawUrl;
+  }
+}
+
+function defaultExternalServices() {
+  return [
+    {
+      id: "mlflow",
+      label: "MLflow",
+      url: "http://localhost:5000",
+      status: "available",
+      external: true,
+      hint: "MLflow tracking UI",
+    },
+    {
+      id: "grafana",
+      label: "Grafana",
+      url: "http://localhost:3000",
+      status: "available",
+      external: true,
+      hint: "Grafana dashboards",
+    },
+    {
+      id: "prometheus",
+      label: "Prometheus",
+      url: "http://localhost:9090",
+      status: "available",
+      external: true,
+      hint: "Prometheus metrics browser",
+    },
+    { id: "api-docs", label: "API Docs", url: "/docs", status: "available", external: false, hint: "" },
+    { id: "metrics", label: "Metrics", url: "/metrics", status: "available", external: false, hint: "" },
+  ];
+}
+
+function mergeExternalServices(baseServices, fetchedServices) {
+  const fetchedById = new Map((fetchedServices || []).map((service) => [service.id, service]));
+  return baseServices.map((service) => ({ ...service, ...(fetchedById.get(service.id) || {}) }));
+}
+
+function renderExternalLinks(services = []) {
+  const row = el("externalLinksRow");
+  row.innerHTML = "";
+  const downCount = services.filter((service) => service.external && service.status !== "available").length;
+  el("externalLinksState").textContent = downCount ? `${downCount} unchecked` : "Available";
+
+  for (const service of services) {
+    const configured = Boolean(service.url);
+    const resolvedUrl = configured ? resolveInfraUrl(service.url) : "";
+    const node = document.createElement(configured ? "a" : "span");
+    node.className = `ext-link ${configured ? "" : "disabled"}`.trim();
+    node.textContent = service.label;
+    node.title = configured
+      ? `${resolvedUrl}${service.status === "unavailable" ? " (not reachable from API probe)" : ""}`
+      : `${service.label} unavailable. ${service.hint || ""}`.trim();
+    node.dataset.status = service.status || "unknown";
+    if (configured) {
+      node.setAttribute("href", resolvedUrl);
+      node.target = "_blank";
+      node.rel = "noopener";
+    }
+    row.appendChild(node);
+  }
+}
+
+async function refreshExternalLinks() {
+  try {
+    const payload = await api("/integrations/external-links");
+    state.externalLinks = mergeExternalServices(defaultExternalServices(), payload.services || []);
+    renderExternalLinks(state.externalLinks);
+  } catch (_error) {
+    el("externalLinksState").textContent = "Unavailable";
+    renderExternalLinks(defaultExternalServices());
+  }
 }
 
 function setNotice(message, tone = "info") {
@@ -90,22 +232,42 @@ function setActiveTab(name) {
   el("liveTabButton").classList.toggle("active", live);
   el("opsTabButton").classList.toggle("active", ops);
   el("historyTabButton").classList.toggle("active", !live && !ops);
-  if (ops) refreshOps();
+  if (ops) { refreshOps(); refreshBenchmark(); }
   if (!live && !ops) refreshHistory();
 }
 
 async function refreshHealth() {
   try {
     const health = await api("/health");
+    state.health = health;
     el("modelValue").textContent = health.model_backend || "-";
     el("modelValue").title =
       `Feature schema ${health.feature_schema_version} / ${health.feature_schema_hash}`;
+    const fs = health.feature_store_backend || "memory";
+    const driftState = health.drift_baseline_fitted
+      ? "drift active"
+      : `drift warmup ${health.drift_ingest_count || 0}/30`;
     el("serviceState").textContent =
-      `${health.env} / ${health.persistence_backend} / ${health.model_backend} / schema ${String(health.feature_schema_hash || "").slice(0, 8)}`;
+      `${health.env} / ${health.persistence_backend} / fs:${fs} / ${health.model_backend} / ${driftState}`;
+    renderDriftWarmup(health.drift_baseline_fitted, health.drift_ingest_count || 0);
   } catch (error) {
     el("serviceState").textContent = "Offline";
     setNotice(`Service unavailable: ${error.message}`, "error");
   }
+}
+
+function renderDriftWarmup(fitted, ingestCount) {
+  const bar = el("driftWarmupBar");
+  if (!bar) return;
+  if (fitted) {
+    bar.hidden = true;
+    return;
+  }
+  const pct = Math.min(100, Math.round((ingestCount / 30) * 100));
+  bar.hidden = false;
+  el("driftWarmupLabel").textContent = `Fitting baseline (${ingestCount}/30 events)`;
+  el("driftWarmupFill").style.width = `${pct}%`;
+  el("driftWarmupPct").textContent = `${pct}%`;
 }
 
 async function refreshModels() {
@@ -236,21 +398,49 @@ async function refreshMetrics() {
 
 async function refreshOps() {
   try {
-    const [readiness, alerts, replayEvaluation, replaySuite] = await Promise.all([
-      api("/deployment/readiness"),
+    const datasetPayload = await api("/data-sources/replay-datasets");
+    state.replayDatasets = datasetPayload.datasets || [];
+    if (
+      !state.selectedReplayDataset
+      || !state.replayDatasets.some((item) => item.path === state.selectedReplayDataset)
+    ) {
+      state.selectedReplayDataset =
+        state.replayDatasets.find((item) => item.path === "examples/replay_telemetry.csv")?.path
+        || state.replayDatasets[0]?.path
+        || "examples/replay_telemetry.csv";
+    }
+    const [readiness, alerts, replayEvaluation, replaySuite, trainingJobsPayload] = await Promise.all([
+      api("/deployment/readiness?mode=production"),
       api("/monitoring/alerts"),
-      api("/evaluation/replay"),
+      api(`/evaluation/replay?dataset_path=${encodeURIComponent(state.selectedReplayDataset)}`),
       api("/evaluation/replay-suite"),
+      api("/training/jobs"),
       refreshMetrics(),
     ]);
     state.readiness = readiness;
     state.alerts = alerts;
     state.replayEvaluation = replayEvaluation;
     state.replaySuite = replaySuite;
+    state.trainingJobs = trainingJobsPayload.jobs || [];
+    await refreshDatasetManifest();
     state.comparison = (await api("/monitoring/model-comparison")).models || [];
+    try {
+      state.shadow = await api("/shadow/status");
+    } catch (_err) {
+      // shadow endpoint optional
+    }
     renderOps();
   } catch (error) {
     setNotice(`Could not load operations view: ${error.message}`, "error");
+  }
+}
+
+async function refreshBenchmark() {
+  try {
+    state.replayBenchmark = await api("/evaluation/replay-benchmark");
+    renderOps();
+  } catch (error) {
+    setNotice(`Could not load benchmark: ${error.message}`, "error");
   }
 }
 
@@ -332,6 +522,141 @@ async function tickSimulation() {
     clearTimeout(state.timer);
     setControls();
     setNotice(`Simulation request failed: ${error.message}`, "error");
+  }
+}
+
+async function refreshDatasetManifest() {
+  const selected = state.replayDatasets.find((item) => item.path === state.selectedReplayDataset);
+  if (!selected?.has_manifest) {
+    state.datasetManifest = null;
+    return;
+  }
+  try {
+    state.datasetManifest = await api(
+      `/data-sources/replay-datasets/${encodeURIComponentPath(state.selectedReplayDataset)}/manifest`
+    );
+  } catch (_error) {
+    state.datasetManifest = null;
+  }
+}
+
+async function selectReplayDataset(path) {
+  state.selectedReplayDataset = path;
+  await refreshDatasetManifest();
+  await refreshOps();
+}
+
+async function runReplayCheck() {
+  const kind = el("replayRunKindSelect").value;
+  const payload = {
+    kind,
+    dataset_path: state.selectedReplayDataset,
+  };
+  try {
+    el("replayRunButton").disabled = true;
+    el("runCheckState").textContent = "Running replay…";
+    const result = await api("/evaluation/replay/run", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    state.replayRun = result;
+    el("runCheckState").textContent = `Replay ${kind}`;
+    renderRunChecks();
+  } catch (error) {
+    setNotice(`Could not run replay check: ${error.message}`, "error");
+    el("runCheckState").textContent = "Replay error";
+  } finally {
+    el("replayRunButton").disabled = false;
+  }
+}
+
+async function runRegressionCheck() {
+  const payload = {
+    laps: Number(el("regressionLapsInput").value || 18),
+    seed: Number(el("regressionSeedInput").value || 11),
+    target_latency_ms: el("regressionLatencyInput").value.trim() ? Number(el("regressionLatencyInput").value) : null,
+    max_temporal_oscillation_s: el("regressionOscillationInput").value.trim() ? Number(el("regressionOscillationInput").value) : null,
+    min_calibration_width_s: Number(el("regressionMinWidthInput").value || 0.2),
+    max_calibration_width_s: el("regressionMaxWidthInput").value.trim() ? Number(el("regressionMaxWidthInput").value) : null,
+  };
+  try {
+    el("regressionRunButton").disabled = true;
+    el("runCheckState").textContent = "Running regression…";
+    const result = await api("/regression/run", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    state.regressionRun = result;
+    el("runCheckState").textContent = result.passed ? "Regression pass" : "Regression fail";
+    renderRunChecks();
+  } catch (error) {
+    setNotice(`Could not run regression suite: ${error.message}`, "error");
+    el("runCheckState").textContent = "Regression error";
+  } finally {
+    el("regressionRunButton").disabled = false;
+  }
+}
+
+function setExportSourceTab(source) {
+  el("fastf1ExportForm").hidden = source !== "fastf1";
+  el("openf1ExportForm").hidden = source !== "openf1";
+  el("fastf1TabBtn").classList.toggle("active", source === "fastf1");
+  el("openf1TabBtn").classList.toggle("active", source === "openf1");
+}
+
+async function exportOpenF1Session() {
+  const payload = {
+    year: Number(el("openf1YearInput").value || 2024),
+    event: el("openf1EventInput").value || "Bahrain",
+    session: el("openf1SessionInput").value || "Race",
+    driver: el("openf1DriverInput").value || "VER",
+  };
+  try {
+    el("openf1ExportButton").disabled = true;
+    el("openf1ExportButton").textContent = "Exporting…";
+    const manifest = await api("/data-sources/openf1/export", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    state.selectedReplayDataset = manifest.output;
+    const laps = manifest.lap_count || "?";
+    const ageObs = manifest.tyre_age_observed ? " · tyre_age observed ✓" : "";
+    setNotice(`OpenF1 exported: ${manifest.output} (${laps} laps${ageObs})`);
+    await refreshOps();
+  } catch (error) {
+    setNotice(`OpenF1 export failed: ${error.message}`, "error");
+  } finally {
+    el("openf1ExportButton").disabled = false;
+    el("openf1ExportButton").textContent = "Export";
+  }
+}
+
+async function exportFastF1Replay() {
+  const payload = {
+    year: Number(el("fastf1YearInput").value || 2024),
+    event: el("fastf1EventInput").value || "Bahrain",
+    session: el("fastf1SessionInput").value || "R",
+    driver: el("fastf1DriverInput").value || "VER",
+    output: el("fastf1OutputInput").value || null,
+    cache_dir: "data/fastf1-cache",
+  };
+  try {
+    el("fastf1ExportButton").disabled = true;
+    const manifest = await api("/data-sources/fastf1/export", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    state.selectedReplayDataset = manifest.output;
+    setNotice(`FastF1 replay exported: ${manifest.output}`);
+    await refreshOps();
+  } catch (error) {
+    setNotice(`FastF1 export failed: ${error.message}`, "error");
+  } finally {
+    el("fastf1ExportButton").disabled = false;
   }
 }
 
@@ -481,14 +806,30 @@ function resetDashboard() {
   el("alertCountValue").textContent = "-";
   el("rollbackValue").textContent = "-";
   el("replayGateValue").textContent = "-";
+  el("featureStoreValue").textContent = "-";
   el("activeArtifactValue").textContent = "-";
   el("promotedArtifactValue").textContent = "-";
+  if (el("driftWarmupBar")) el("driftWarmupBar").hidden = true;
   el("readinessChecks").innerHTML = "";
   el("alertList").innerHTML = "";
   el("replaySummary").innerHTML = "";
   el("replayGates").innerHTML = "";
-  el("replaySuiteRows").innerHTML = `<tr><td colspan="8">No replay suite</td></tr>`;
-  el("artifactRows").innerHTML = `<tr><td colspan="6">No registered artifacts</td></tr>`;
+  el("replaySuiteRows").innerHTML = `<tr><td colspan="9">No replay suite</td></tr>`;
+  el("replayBenchmarkRows").innerHTML = `<tr><td colspan="9">No benchmark suite</td></tr>`;
+  el("replayRunSummary").innerHTML = "";
+  el("replayRunGates").innerHTML = "";
+  el("regressionSummary").innerHTML = "";
+  el("regressionChecks").innerHTML = "";
+  el("runCheckState").textContent = "Idle";
+  el("replayRunState").textContent = "Ready";
+  el("regressionRunState").textContent = "Ready";
+  state.replayRun = null;
+  state.regressionRun = null;
+  el("dataSourceState").textContent = "No datasets";
+  el("replayDatasetRows").innerHTML = `<tr><td colspan="8">No replay datasets</td></tr>`;
+  el("datasetDetailGrid").innerHTML = "";
+  el("fieldProvenanceList").innerHTML = "";
+  el("artifactRows").innerHTML = `<tr><td colspan="8">No registered artifacts</td></tr>`;
   el("artifactDetailGrid").innerHTML = "";
   el("artifactBlockers").innerHTML = "";
   el("artifactSuiteRows").innerHTML = `<tr><td colspan="9">No replay suite</td></tr>`;
@@ -501,6 +842,8 @@ function resetDashboard() {
   state.latestTelemetry = null;
   renderTirePressureMap();
   drawCharts();
+  renderShadow();
+  renderRunChecks();
 }
 
 function renderStrategy() {
@@ -545,18 +888,48 @@ function renderMetrics() {
   el("brakeValue").textContent = `${num(metrics.f1_brake_temp_next_lap_c, 0)} C`;
   el("overheatValue").textContent = pct(metrics.f1_overheating_probability);
 
-  const drift = Object.entries(metrics)
-    .filter(([name]) => name.startsWith("f1_drift_z_score_"))
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, 8);
+  // PSI and concept drift keys land in feature_scores as psi_<name> and concept_drift_z,
+  // which monitoring exports as drift_z_score_psi_<name> / drift_z_score_concept_drift_z.
+  const allDrift = Object.fromEntries(
+    Object.entries(metrics)
+      .filter(([name]) => name.startsWith("f1_drift_z_score_"))
+      .map(([name, value]) => [name.replace("f1_drift_z_score_", ""), value])
+  );
+  const zScores = Object.fromEntries(
+    Object.entries(allDrift).filter(([k]) => !k.startsWith("psi_") && k !== "concept_drift_z")
+  );
+  const psiScores = Object.fromEntries(
+    Object.entries(allDrift)
+      .filter(([k]) => k.startsWith("psi_"))
+      .map(([k, v]) => [k.replace("psi_", ""), v])
+  );
+  const conceptZ = allDrift["concept_drift_z"] ?? Number.NaN;
+  const driftNames = Object.keys(zScores).sort((a, b) => (zScores[b] || 0) - (zScores[a] || 0));
   const rows = el("driftRows");
   rows.innerHTML = "";
-  if (!drift.length) {
-    rows.innerHTML = `<tr><td>No baseline fitted</td><td>-</td></tr>`;
+  if (!driftNames.length && !Number.isFinite(conceptZ)) {
+    rows.innerHTML = `<tr><td colspan="4">No baseline fitted</td></tr>`;
   } else {
-    for (const [name, value] of drift) {
-      const label = name.replace("f1_drift_z_score_", "").replaceAll("_", " ");
-      rows.innerHTML += `<tr><td>${label}</td><td>${num(value, 2)}</td></tr>`;
+    for (const name of driftNames.slice(0, 8)) {
+      const z = zScores[name] ?? Number.NaN;
+      const psi = psiScores[name] ?? Number.NaN;
+      const status = z >= 3 || psi >= 0.2 ? "alert" : psi >= 0.1 ? "warn" : "ok";
+      const statusLabel = status === "alert" ? "Alert" : status === "warn" ? "Warn" : "OK";
+      rows.innerHTML += `<tr>
+        <td>${name.replaceAll("_", " ")}</td>
+        <td>${Number.isFinite(z) ? num(z, 2) : "-"}</td>
+        <td>${Number.isFinite(psi) ? num(psi, 3) : "-"}</td>
+        <td class="drift-${status}">${statusLabel}</td>
+      </tr>`;
+    }
+    if (Number.isFinite(conceptZ)) {
+      const status = conceptZ >= 3 ? "alert" : conceptZ >= 1.5 ? "warn" : "ok";
+      rows.innerHTML += `<tr>
+        <td>concept drift</td>
+        <td>${num(conceptZ, 2)}</td>
+        <td>-</td>
+        <td class="drift-${status}">${status === "alert" ? "Alert" : status === "warn" ? "Warn" : "OK"}</td>
+      </tr>`;
     }
   }
 
@@ -594,11 +967,20 @@ function renderOps() {
   const rollback = readiness.rollback_candidate;
   el("rollbackValue").textContent = rollback ? shortRunId(rollback.artifact_id) : "None";
   el("rollbackValue").title = rollback?.artifact_id || "";
+  const health = state.health;
+  if (health) {
+    const fs = health.feature_store_backend || "memory";
+    el("featureStoreValue").textContent = fs;
+    el("featureStoreValue").className = fs === "redis" ? "risk-low" : "risk-medium";
+    renderDriftWarmup(health.drift_baseline_fitted, health.drift_ingest_count || 0);
+  }
   renderArtifactAlignment(readiness);
   el("readinessState").textContent =
-    `${readiness.active_backend} / ${readiness.active_artifact_id}`;
+    `${readiness.mode || "local"} / ${readiness.active_backend} / ${readiness.active_artifact_id}`;
   el("alertState").textContent = `${alerts.length} active`;
+  renderReplayDataSources();
   renderReplayEvaluation();
+  renderRunChecks();
 
   const checks = el("readinessChecks");
   checks.innerHTML = "";
@@ -628,6 +1010,196 @@ function renderOps() {
   renderOpsCharts();
   renderModelComparison();
   renderArtifactRelease();
+  renderShadow();
+  renderLiveData();
+  renderTrainingJobs();
+  renderRunChecks();
+}
+
+function renderRunChecks() {
+  renderReplayRun();
+  renderRegressionRun();
+}
+
+function renderReplayRun() {
+  const payload = state.replayRun;
+  const summary = el("replayRunSummary");
+  const gates = el("replayRunGates");
+  if (!summary || !gates) return;
+  if (!payload) {
+    summary.innerHTML = "";
+    gates.innerHTML = "";
+    return;
+  }
+  summary.innerHTML = "";
+  gates.innerHTML = "";
+  const report = payload.report || null;
+  const suite = payload.suite || null;
+  const items = report
+    ? [
+        ["Dataset", shortRunId(report.dataset_path)],
+        ["Trust", replayTrust(report.data_provenance || {}).label],
+        ["Signal", report.data_provenance?.validation_signal || "-"],
+        ["Labels", `${report.labeled_event_count} / ${report.event_count}`],
+        ["MAE", `${num(report.scenario?.mae_lap_delta_s, 4)}s`],
+        ["Coverage", `${num(report.scenario?.coverage_pct, 1)}%`],
+        ["Calibration", `${num(report.scenario?.calibration_error_pct, 1)}%`],
+        ["Width", `${num(report.scenario?.mean_interval_width_s, 3)}s`],
+      ]
+    : suite
+      ? [
+          ["Suite", suite.suite_name || payload.kind || "-"],
+          ["Splits", suite.split_count ?? "-"],
+          ["Events", suite.total_event_count ?? "-"],
+          ["Labels", suite.total_labeled_event_count ?? "-"],
+          ["MAE", `${num(suite.mean_mae_lap_delta_s, 4)}s`],
+          ["Coverage", `${num(suite.mean_coverage_pct, 1)}%`],
+        ]
+      : [];
+  for (const [label, value] of items) {
+    const item = document.createElement("div");
+    item.className = "detail-item";
+    item.innerHTML = `<span>${label}</span><strong title="${value}">${value}</strong>`;
+    summary.appendChild(item);
+  }
+  const gatesData = report?.gates || suite?.splits?.reduce((acc, split, index) => {
+    acc[`split ${index + 1}`] = split.passed;
+    return acc;
+  }, {}) || {};
+  for (const [name, passed] of Object.entries(gatesData)) {
+    const item = document.createElement("div");
+    item.className = `check-item ${passed ? "pass" : "fail"}`;
+    item.innerHTML = `<span>${name}</span><strong>${passed ? "Pass" : "Fail"}</strong>`;
+    gates.appendChild(item);
+  }
+}
+
+function renderRegressionRun() {
+  const payload = state.regressionRun;
+  const summary = el("regressionSummary");
+  const checks = el("regressionChecks");
+  if (!summary || !checks) return;
+  if (!payload) {
+    summary.innerHTML = "";
+    checks.innerHTML = "";
+    return;
+  }
+  summary.innerHTML = "";
+  checks.innerHTML = "";
+  const items = [
+    ["Laps", payload.config?.laps ?? "-"],
+    ["Seed", payload.config?.seed ?? "-"],
+    ["Latency", payload.config?.target_latency_ms != null ? `${num(payload.config.target_latency_ms, 1)} ms` : "auto"],
+    ["Oscillation", payload.config?.max_temporal_oscillation_s != null ? `${num(payload.config.max_temporal_oscillation_s, 2)} s` : "auto"],
+    ["Min Width", `${num(payload.config?.min_calibration_width_s, 2)} s`],
+    ["Max Width", payload.config?.max_calibration_width_s != null ? `${num(payload.config.max_calibration_width_s, 2)} s` : "auto"],
+  ];
+  for (const [label, value] of items) {
+    const item = document.createElement("div");
+    item.className = "detail-item";
+    item.innerHTML = `<span>${label}</span><strong title="${value}">${value}</strong>`;
+    summary.appendChild(item);
+  }
+  for (const result of payload.results || []) {
+    const item = document.createElement("div");
+    item.className = `check-item ${result.passed ? "pass" : "fail"}`;
+    item.innerHTML = `<span>${result.name.replaceAll("_", " ")}</span><strong>${num(result.value, 4)} / ${num(result.threshold, 4)}</strong>`;
+    checks.appendChild(item);
+  }
+}
+
+function renderRunChecks() {
+  renderReplayRun();
+  renderRegressionRun();
+}
+
+function renderReplayRun() {
+  const payload = state.replayRun;
+  const summary = el("replayRunSummary");
+  const gates = el("replayRunGates");
+  if (!payload) {
+    el("replayRunState").textContent = "Ready";
+    summary.innerHTML = "";
+    gates.innerHTML = "";
+    return;
+  }
+  el("replayRunState").textContent = payload.kind || "dataset";
+  summary.innerHTML = "";
+  gates.innerHTML = "";
+  const suite = payload.suite || null;
+  const report = payload.report || null;
+  const items = report
+    ? [
+        ["Dataset", shortRunId(report.dataset_path)],
+        ["Trust", replayTrust(report.data_provenance || {}).label],
+        ["Signal", report.data_provenance?.validation_signal || "-"],
+        ["Labels", `${report.labeled_event_count} / ${report.event_count}`],
+        ["MAE", `${num(report.scenario?.mae_lap_delta_s, 4)}s`],
+        ["Coverage", `${num(report.scenario?.coverage_pct, 1)}%`],
+        ["Calibration", `${num(report.scenario?.calibration_error_pct, 1)}%`],
+        ["Width", `${num(report.scenario?.mean_interval_width_s, 3)}s`],
+      ]
+    : suite
+      ? [
+          ["Suite", suite.suite_name || payload.kind || "-"],
+          ["Splits", suite.split_count ?? "-"],
+          ["Events", suite.total_event_count ?? "-"],
+          ["Labels", suite.total_labeled_event_count ?? "-"],
+          ["MAE", `${num(suite.mean_mae_lap_delta_s, 4)}s`],
+          ["Coverage", `${num(suite.mean_coverage_pct, 1)}%`],
+        ]
+      : [];
+  for (const [label, value] of items) {
+    const item = document.createElement("div");
+    item.className = "detail-item";
+    item.innerHTML = `<span>${label}</span><strong title="${value}">${value}</strong>`;
+    summary.appendChild(item);
+  }
+  const target = report?.gates || suite?.splits?.reduce((acc, split, index) => {
+    acc[`split_${index + 1}`] = split.passed;
+    return acc;
+  }, {}) || {};
+  for (const [name, passed] of Object.entries(target)) {
+    const item = document.createElement("div");
+    item.className = `check-item ${passed ? "pass" : "fail"}`;
+    item.innerHTML = `<span>${String(name).replaceAll("_", " ")}</span><strong>${passed ? "Pass" : "Fail"}</strong>`;
+    gates.appendChild(item);
+  }
+}
+
+function renderRegressionRun() {
+  const payload = state.regressionRun;
+  const summary = el("regressionSummary");
+  const checks = el("regressionChecks");
+  if (!payload) {
+    el("regressionRunState").textContent = "Ready";
+    summary.innerHTML = "";
+    checks.innerHTML = "";
+    return;
+  }
+  el("regressionRunState").textContent = payload.passed ? "Pass" : "Fail";
+  summary.innerHTML = "";
+  checks.innerHTML = "";
+  const items = [
+    ["Laps", payload.config?.laps ?? "-"],
+    ["Seed", payload.config?.seed ?? "-"],
+    ["Latency", payload.config?.target_latency_ms != null ? `${num(payload.config.target_latency_ms, 1)} ms` : "auto"],
+    ["Oscillation", payload.config?.max_temporal_oscillation_s != null ? `${num(payload.config.max_temporal_oscillation_s, 2)} s` : "auto"],
+    ["Min Width", `${num(payload.config?.min_calibration_width_s, 2)} s`],
+    ["Max Width", payload.config?.max_calibration_width_s != null ? `${num(payload.config.max_calibration_width_s, 2)} s` : "auto"],
+  ];
+  for (const [label, value] of items) {
+    const item = document.createElement("div");
+    item.className = "detail-item";
+    item.innerHTML = `<span>${label}</span><strong title="${value}">${value}</strong>`;
+    summary.appendChild(item);
+  }
+  for (const result of payload.results || []) {
+    const item = document.createElement("div");
+    item.className = `check-item ${result.passed ? "pass" : "fail"}`;
+    item.innerHTML = `<span>${result.name.replaceAll("_", " ")}</span><strong>${num(result.value, 4)} / ${num(result.threshold, 4)}</strong>`;
+    checks.appendChild(item);
+  }
 }
 
 function renderArtifactAlignment(readiness) {
@@ -648,24 +1220,158 @@ function promotedArtifactForBackend(activeBackend) {
   return promoted[normalized] || promoted.sequence || Object.values(promoted)[0] || "";
 }
 
+function renderReplayDataSources() {
+  const rows = el("replayDatasetRows");
+  const select = el("replayDatasetSelect");
+  const datasets = state.replayDatasets || [];
+  rows.innerHTML = "";
+  select.innerHTML = "";
+  el("dataSourceState").textContent = datasets.length
+    ? `${datasets.length} datasets`
+    : "No datasets";
+  populateLiveDatasetSelect();
+  populateTrainingRealDataSelect();
+  if (!datasets.length) {
+    rows.innerHTML = `<tr><td colspan="8">No replay datasets</td></tr>`;
+    renderDatasetDetail(null);
+    return;
+  }
+  for (const dataset of datasets) {
+    const provenance = dataset.data_provenance || {};
+    const productionReady = provenance.production_validation_ready === true;
+    const option = document.createElement("option");
+    option.value = dataset.path;
+    option.textContent = dataset.path;
+    select.appendChild(option);
+
+    const row = document.createElement("tr");
+    row.className = dataset.path === state.selectedReplayDataset ? "selected" : "";
+    row.tabIndex = 0;
+    row.title = dataset.path;
+    row.innerHTML = `
+      <td>${shortRunId(dataset.path)}</td>
+      <td>${dataset.source || "replay"}</td>
+      <td>${dataset.event_count ?? "-"}</td>
+      <td>${dataset.labeled_event_count ?? "-"}</td>
+      <td>${trustBadge(provenance)}</td>
+      <td>${provenance.lap_time_label || "-"}</td>
+      <td class="${productionReady ? "risk-low" : "risk-medium"}">${productionReady ? "Yes" : "No"}</td>
+      <td class="${dataset.has_manifest ? "risk-low" : "risk-medium"}">${dataset.has_manifest ? "Yes" : "No"}</td>
+    `;
+    row.addEventListener("click", () => selectReplayDataset(dataset.path));
+    row.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") {
+        event.preventDefault();
+        selectReplayDataset(dataset.path);
+      }
+    });
+    rows.appendChild(row);
+  }
+  select.value = state.selectedReplayDataset;
+  renderDatasetDetail(datasets.find((item) => item.path === state.selectedReplayDataset));
+}
+
+function renderDatasetDetail(dataset) {
+  const grid = el("datasetDetailGrid");
+  grid.innerHTML = "";
+  if (!dataset) {
+    grid.innerHTML = `<div class="detail-item"><span>Dataset</span><strong>No dataset selected</strong></div>`;
+    renderFieldProvenance({});
+    return;
+  }
+  const manifest = state.datasetManifest || {};
+  const provenance = dataset.data_provenance || {};
+  const items = [
+    ["Dataset", shortRunId(dataset.path)],
+    ["Source", dataset.source || "replay"],
+    ["Trust", replayTrust(provenance).label],
+    ["Signal", provenance.validation_signal || dataset.validation_signal || "-"],
+    ["Label Type", provenance.lap_time_label || "-"],
+    ["Prod Ready", provenance.production_validation_ready ? "Yes" : "No"],
+    ["Reference Lap", provenance.reference_lap_time_s ? `${num(provenance.reference_lap_time_s, 3)}s` : "-"],
+    ["Observed Fields", provenance.observed_field_count ?? "-"],
+    ["Proxy Fields", provenance.proxy_diagnostic_field_count ?? "-"],
+    ["Rows", dataset.event_count ?? "-"],
+    ["Labels", dataset.labeled_event_count ?? "-"],
+    ["Laps", dataset.lap_count ?? manifest.lap_count ?? "-"],
+    ["Manifest", dataset.has_manifest ? "Available" : "Missing"],
+    ["Fingerprint", shortRunId(dataset.dataset_fingerprint || manifest.dataset_fingerprint || "-")],
+    ["Generated", manifest.generated_at ? shortRunId(manifest.generated_at) : "-"],
+  ];
+  for (const [label, value] of items) {
+    const item = document.createElement("div");
+    item.className = "detail-item";
+    item.innerHTML = `<span>${label}</span><strong title="${value}">${value}</strong>`;
+    grid.appendChild(item);
+  }
+  renderFieldProvenance(manifest.field_provenance || dataset.field_provenance || {});
+  renderProvenanceLimitations(provenance.limitations || manifest.limitations || []);
+}
+
+function renderFieldProvenance(provenance) {
+  const list = el("fieldProvenanceList");
+  list.innerHTML = "";
+  const entries = Object.entries(provenance);
+  if (!entries.length) {
+    list.innerHTML = `<div class="check-item"><span>Field provenance</span><strong>Unavailable</strong></div>`;
+    return;
+  }
+  const groups = { observed: 0, synthetic: 0, derived: 0, fallback: 0, unavailable: 0, other: 0 };
+  for (const [, description] of entries) {
+    const kind = String(description).split(":")[0];
+    if (kind in groups) groups[kind] += 1;
+    else groups.other += 1;
+  }
+  for (const [kind, count] of Object.entries(groups).filter(([, count]) => count > 0)) {
+    const item = document.createElement("div");
+    item.className = `check-item ${kind === "observed" ? "pass" : kind === "synthetic" ? "warn" : "fail"}`;
+    item.innerHTML = `<span>${kind} fields</span><strong>${count}</strong>`;
+    list.appendChild(item);
+  }
+}
+
+function renderProvenanceLimitations(limitations) {
+  const list = el("fieldProvenanceList");
+  for (const limitation of limitations.slice(0, 3)) {
+    const item = document.createElement("div");
+    item.className = "check-item fail";
+    item.innerHTML = `<span title="${limitation}">${limitation}</span><strong>Limit</strong>`;
+    list.appendChild(item);
+  }
+}
+
 function renderReplayEvaluation() {
   const report = state.replayEvaluation;
+  const benchmark = state.replayBenchmark;
   if (!report) {
     el("replayGateValue").textContent = "-";
     el("replayState").textContent = "Waiting";
     return;
   }
   const scenario = report.scenario || {};
-  el("replayGateValue").textContent = report.passed ? "Pass" : "Fail";
-  el("replayGateValue").className = report.passed ? "risk-low" : "risk-high";
+  const provenance = report.data_provenance || {};
+  const benchmarkPassed = benchmark?.passed === true;
+  el("replayGateValue").textContent = benchmark ? (benchmarkPassed ? "Pass" : "Fail") : "-";
+  el("replayGateValue").className = benchmarkPassed ? "risk-low" : "risk-high";
   el("replayState").textContent =
-    `${shortRunId(report.dataset_path)} / ${String(report.dataset_fingerprint || "").slice(0, 8)}`;
-  el("replayState").title = report.dataset_fingerprint || "";
+    benchmark
+      ? `${benchmark.suite_name || "benchmark"} / ${benchmark.split_count || 0} splits`
+      : `${shortRunId(report.dataset_path)} / ${String(report.dataset_fingerprint || "").slice(0, 8)}`;
+  el("replayState").title = benchmark
+    ? `${benchmark.total_labeled_event_count || 0} labeled events`
+    : report.dataset_fingerprint || "";
 
   const summary = el("replaySummary");
   summary.innerHTML = "";
   const items = [
     ["Source", scenario.source || "replay"],
+    ["Trust", replayTrust(provenance).label],
+    ["Signal", provenance.validation_signal || "-"],
+    ["Label Type", provenance.lap_time_label || "-"],
+    ["Prod Ready", provenance.production_validation_ready ? "Yes" : "No"],
+    ["Reference Lap", provenance.reference_lap_time_s ? `${num(provenance.reference_lap_time_s, 3)}s` : "-"],
+    ["Observed Fields", provenance.observed_field_count ?? "-"],
+    ["Proxy Fields", provenance.proxy_diagnostic_field_count ?? "-"],
     ["Events", report.event_count],
     ["Labels", `${report.labeled_event_count} / ${report.event_count}`],
     ["Sessions", report.session_count],
@@ -697,11 +1403,12 @@ function renderReplayEvaluation() {
     item.innerHTML = `<span>${name.replaceAll("_", " ")}</span><strong>${passed ? "Pass" : "Fail"}</strong>`;
     gates.appendChild(item);
   }
-  renderReplaySuite(state.replaySuite);
+  renderReplaySuite(state.replaySuite, "replaySuiteRows");
+  renderReplaySuite(state.replayBenchmark, "replayBenchmarkRows");
 }
 
-function renderReplaySuite(suite) {
-  const rows = el("replaySuiteRows");
+function renderReplaySuite(suite, targetId) {
+  const rows = el(targetId);
   rows.innerHTML = "";
   const splits = suite?.splits || [];
   if (!splits.length) {
@@ -710,10 +1417,12 @@ function renderReplaySuite(suite) {
   }
   for (const split of splits) {
     const scenario = split.scenario || {};
+    const provenance = split.data_provenance || {};
     const row = document.createElement("tr");
     row.innerHTML = `
       <td>${scenario.scenario || "-"}</td>
       <td class="${split.passed ? "risk-low" : "risk-high"}">${split.passed ? "Pass" : "Fail"}</td>
+      <td>${trustBadge(provenance)}</td>
       <td>${num(scenario.mae_lap_delta_s, 4)}s</td>
       <td>${num(scenario.coverage_pct, 1)}%</td>
       <td>${num(scenario.calibration_error_pct, 1)}%</td>
@@ -761,7 +1470,7 @@ function renderArtifactRelease() {
     ? `${artifacts.length} registered`
     : "No artifacts";
   if (!artifacts.length) {
-    rows.innerHTML = `<tr><td colspan="6">No registered artifacts</td></tr>`;
+    rows.innerHTML = `<tr><td colspan="8">No registered artifacts</td></tr>`;
     renderArtifactDetail();
     return;
   }
@@ -770,6 +1479,7 @@ function renderArtifactRelease() {
   }
   for (const artifact of artifacts) {
     const replayPassed = artifact.replay_passed;
+    const productionReady = artifact.production_validation_ready === true;
     const item = document.createElement("tr");
     item.className = artifact.artifact_id === state.selectedArtifactId ? "selected" : "";
     item.tabIndex = 0;
@@ -778,6 +1488,8 @@ function renderArtifactRelease() {
       <td>${shortRunId(artifact.artifact_id)}</td>
       <td>${artifact.status || "-"}</td>
       <td class="${replayPassed === true ? "risk-low" : "risk-high"}">${replayPassed === true ? "Pass" : "Missing"}</td>
+      <td>${artifact.replay_validation_signal || "-"}</td>
+      <td class="${productionReady ? "risk-low" : "risk-medium"}">${productionReady ? "Yes" : "No"}</td>
       <td>${num(artifact.replay_mae_lap_delta_s, 4)}s</td>
       <td>${num(artifact.replay_coverage_pct, 1)}%</td>
       <td title="${artifact.replay_dataset_fingerprint || ""}">${shortRunId(artifact.replay_dataset_fingerprint || "-")}</td>
@@ -818,6 +1530,7 @@ function renderArtifactDetail() {
   const manifest = detail.manifest || {};
   const evalMetrics = manifest.evaluation_metrics || {};
   const replayMetrics = manifest.replay_evaluation_metrics || {};
+  const replayProvenance = manifest.replay_data_provenance || {};
   const items = [
     ["Artifact", shortRunId(detail.artifact_id)],
     ["Backend", manifest.backend || "-"],
@@ -833,6 +1546,13 @@ function renderArtifactDetail() {
     ["Max Pit Error", `${num(evalMetrics.max_pit_target_error_laps, 2)} laps`],
     ["Max Regret", `${num(evalMetrics.max_strategy_regret_s, 3)}s`],
     ["Replay MAE", `${num(replayMetrics.mae_lap_delta_s, 4)}s`],
+    ["Replay Trust", replayTrust(replayProvenance).label],
+    ["Replay Signal", replayMetrics.validation_signal || replayProvenance.validation_signal || "-"],
+    ["Replay Label", replayProvenance.lap_time_label || "-"],
+    ["Prod Validation", replayMetrics.production_validation_ready ? "Yes" : "No"],
+    ["Reference Lap", replayProvenance.reference_lap_time_s ? `${num(replayProvenance.reference_lap_time_s, 3)}s` : "-"],
+    ["Replay Observed", replayProvenance.observed_field_count ?? "-"],
+    ["Replay Proxy", replayProvenance.proxy_diagnostic_field_count ?? "-"],
     ["Replay Coverage", `${num(replayMetrics.coverage_pct, 1)}%`],
     ["Replay Cal Error", `${num(replayMetrics.calibration_error_pct, 1)}%`],
     ["Replay Width", `${num(replayMetrics.mean_interval_width_s, 3)}s`],
@@ -1225,15 +1945,488 @@ function drawLineChart(canvas, rows, series, options = {}) {
   }
 }
 
+async function enableShadow() {
+  const backend = el("shadowBackendSelect").value;
+  try {
+    el("shadowEnableButton").disabled = true;
+    state.shadow = await api(
+      `/shadow/configure?backend=${encodeURIComponent(backend)}`,
+      { method: "POST" }
+    );
+    el("shadowEnableButton").disabled = false;
+    el("shadowDisableButton").disabled = false;
+    setNotice(`Shadow deployment enabled: challenger=${backend}`);
+    renderShadow();
+  } catch (error) {
+    el("shadowEnableButton").disabled = false;
+    setNotice(`Could not enable shadow: ${error.message}`, "error");
+  }
+}
+
+async function disableShadow() {
+  try {
+    await api("/shadow", { method: "DELETE" });
+    state.shadow = { active: false, challenger_backend: "none", total_predictions: 0, recent: [] };
+    el("shadowDisableButton").disabled = true;
+    el("shadowEnableButton").disabled = false;
+    setNotice("Shadow deployment disabled.");
+    renderShadow();
+  } catch (error) {
+    setNotice(`Could not disable shadow: ${error.message}`, "error");
+  }
+}
+
+function renderShadow() {
+  const shadow = state.shadow;
+  const active = shadow?.active === true;
+  el("shadowState").textContent = active
+    ? `Active · ${shadow.challenger_backend}`
+    : "Inactive";
+  el("shadowState").className = active ? "risk-low" : "";
+  el("shadowBackendValue").textContent = active ? (shadow.challenger_backend || "none") : "None";
+  el("shadowTotalValue").textContent = shadow?.total_predictions ?? 0;
+  el("shadowDivergenceValue").textContent = shadow
+    ? pct(shadow.divergence_rate ?? 0)
+    : "-";
+  el("shadowDivergenceValue").className = (shadow?.divergence_rate ?? 0) > 0.3
+    ? "risk-high"
+    : (shadow?.divergence_rate ?? 0) > 0.1
+      ? "risk-medium"
+      : "risk-low";
+  el("shadowMeanDeltaValue").textContent = shadow
+    ? `${num(shadow.mean_abs_delta_s ?? 0, 3)}s`
+    : "-";
+  el("shadowEnableButton").disabled = active;
+  el("shadowDisableButton").disabled = !active;
+
+  const candidate = shadow?.promotion_candidate;
+  const banner = el("shadowPromotionBanner");
+  if (candidate) {
+    banner.hidden = false;
+    el("shadowPromotionDetail").textContent =
+      `${candidate.challenger_backend} is ${num(candidate.improvement_s * 1000, 0)}ms better · ` +
+      `${num(candidate.improvement_pct, 1)}% improvement over ${candidate.window_size} predictions`;
+  } else {
+    banner.hidden = true;
+  }
+
+  const rows = el("shadowRecentRows");
+  rows.innerHTML = "";
+  const recent = (shadow?.recent || []).slice().reverse();
+  if (!recent.length) {
+    rows.innerHTML = `<tr><td colspan="6">${active ? "Waiting for predictions…" : "Shadow deployment inactive"}</td></tr>`;
+    drawShadowChart([]);
+    return;
+  }
+  for (const item of recent.slice(0, 20)) {
+    const absDelta = Math.abs(item.delta_s ?? 0);
+    const cls = absDelta > 0.15 ? "strongly-diverged" : absDelta > 0.05 ? "diverged" : "";
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td>${item.lap ?? "-"}</td>
+      <td>${num(item.champion_delta_s, 3)}s</td>
+      <td>${num(item.challenger_delta_s, 3)}s</td>
+      <td class="${cls}">${num(item.delta_s, 3)}s</td>
+      <td>${num(item.champion_wear, 1)}%</td>
+      <td>${num(item.challenger_wear, 1)}%</td>
+    `;
+    rows.appendChild(row);
+  }
+  drawShadowChart(shadow.recent || []);
+}
+
+function drawShadowChart(data) {
+  const canvas = el("shadowChart");
+  if (!canvas) return;
+  const rows = data.slice(-80);
+  if (!rows.length) {
+    el("shadowChartBand").textContent = "Waiting";
+    const ctx = canvas.getContext("2d");
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#101820";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    ctx.fillStyle = "#314452";
+    ctx.font = "20px Inter, system-ui, sans-serif";
+    ctx.textAlign = "center";
+    ctx.fillText("Waiting for shadow data", canvas.width / 2, canvas.height / 2);
+    return;
+  }
+  el("shadowChartBand").textContent = `${rows.length} observations`;
+  const series = [
+    { key: "champion_delta_s", label: "Champion Δ", color: "#62a8ff" },
+    { key: "challenger_delta_s", label: "Challenger Δ", color: "#f5c45c" },
+  ];
+  drawLineChart(canvas, rows, series, { xLabel: "Predictions", yUnit: "s" });
+}
+
 el("startButton").addEventListener("click", startSimulation);
 el("pauseButton").addEventListener("click", stopSimulation);
 el("tickButton").addEventListener("click", tickSimulation);
 el("resetButton").addEventListener("click", resetSimulation);
 el("modelSelect").addEventListener("change", changeModelBackend);
 el("artifactSelect").addEventListener("change", changeModelArtifact);
+el("fastf1ExportButton").addEventListener("click", exportFastF1Replay);
+el("openf1ExportButton").addEventListener("click", exportOpenF1Session);
+el("fastf1TabBtn").addEventListener("click", () => setExportSourceTab("fastf1"));
+el("openf1TabBtn").addEventListener("click", () => setExportSourceTab("openf1"));
+el("validateDatasetButton").addEventListener("click", refreshOps);
+el("replayDatasetSelect").addEventListener("change", (event) => selectReplayDataset(event.target.value));
 el("historyRefreshButton").addEventListener("click", refreshHistory);
 el("historySortSelect").addEventListener("change", (event) => setHistorySort(event.target.value));
 el("historySortDirectionButton").addEventListener("click", toggleHistorySortDirection);
+// ── Live data ──────────────────────────────────────────────────────────────
+
+function setLiveMode(mode) {
+  state.liveMode = mode;
+  el("replayModeBtn").classList.toggle("active", mode === "replay");
+  el("liveModeBtn").classList.toggle("active", mode === "live");
+  el("replayControls").hidden = mode !== "replay";
+  el("liveTimingControls").hidden = mode !== "live";
+}
+
+function populateLiveDatasetSelect() {
+  const select = el("liveReplayDatasetSelect");
+  const current = select.value;
+  select.innerHTML = `<option value="">Select dataset…</option>`;
+  for (const dataset of state.replayDatasets || []) {
+    const opt = document.createElement("option");
+    opt.value = dataset.path;
+    opt.textContent = dataset.path;
+    select.appendChild(opt);
+  }
+  if (current) select.value = current;
+}
+
+async function startLiveReplay() {
+  const dataset = el("liveReplayDatasetSelect").value;
+  if (!dataset) {
+    setNotice("Select a replay dataset first.", "error");
+    return;
+  }
+  const speed = Number(el("liveSpeedInput").value || 5);
+  try {
+    el("liveReplayStartBtn").disabled = true;
+    state.liveStatus = await api("/live-data/replay/start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ dataset_path: dataset, speed_multiplier: speed }),
+    });
+    el("liveStopBtn").disabled = false;
+    state.livePredictions = [];
+    setNotice(`Replay started: ${dataset} at ${speed}× speed`);
+    renderLiveData();
+    scheduleLivePoll();
+  } catch (error) {
+    el("liveReplayStartBtn").disabled = false;
+    setNotice(`Could not start replay: ${error.message}`, "error");
+  }
+}
+
+async function startLiveTiming() {
+  const driver = el("liveDriverInput").value.trim() || "VER";
+  const sessionId = el("liveSessionIdInput").value.trim() || "live-session";
+  const noAuth = el("liveNoAuthInput").checked;
+  try {
+    el("liveTimingStartBtn").disabled = true;
+    state.liveStatus = await api("/live-data/live/start", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ driver, session_id: sessionId, no_auth: noAuth }),
+    });
+    el("liveTimingStopBtn").disabled = false;
+    state.livePredictions = [];
+    setNotice(`Live timing connecting: driver=${driver} session=${sessionId}`);
+    renderLiveData();
+    scheduleLivePoll();
+  } catch (error) {
+    el("liveTimingStartBtn").disabled = false;
+    setNotice(`Could not start live timing: ${error.message}`, "error");
+  }
+}
+
+async function stopLiveData() {
+  clearTimeout(state.liveTimer);
+  try {
+    await api("/live-data", { method: "DELETE" });
+    state.liveStatus = null;
+    el("liveReplayStartBtn").disabled = false;
+    el("liveTimingStartBtn").disabled = false;
+    el("liveStopBtn").disabled = true;
+    el("liveTimingStopBtn").disabled = true;
+    setNotice("Live data stopped.");
+    renderLiveData();
+  } catch (error) {
+    setNotice(`Could not stop live data: ${error.message}`, "error");
+  }
+}
+
+function scheduleLivePoll() {
+  clearTimeout(state.liveTimer);
+  state.liveTimer = setTimeout(async () => {
+    try {
+      state.liveStatus = await api("/live-data/status");
+      const pred = latestPrediction();
+      if (pred) state.livePredictions.push(pred);
+      state.livePredictions = state.livePredictions.slice(-80);
+      renderLiveData();
+      if (state.liveStatus?.connected) scheduleLivePoll();
+      else {
+        el("liveReplayStartBtn").disabled = false;
+        el("liveTimingStartBtn").disabled = false;
+        el("liveStopBtn").disabled = true;
+        el("liveTimingStopBtn").disabled = true;
+      }
+    } catch (_err) {
+      scheduleLivePoll();
+    }
+  }, 900);
+}
+
+function renderLiveData() {
+  const s = state.liveStatus;
+  const badge = el("liveDataState");
+
+  if (!s || s.mode === "idle") {
+    badge.textContent = "Idle";
+    badge.className = "live-badge";
+    el("liveModeBadge").textContent = "—";
+    el("liveEventCount").textContent = "0";
+    el("liveEventRate").textContent = "—";
+    el("liveLatestLap").textContent = "—";
+    el("liveLapTime").textContent = "—";
+    el("liveCompound").textContent = "—";
+    el("liveProgress").textContent = "—";
+    el("liveMessages").textContent = "—";
+    el("liveError").hidden = true;
+    el("liveFeedBand").textContent = "Waiting";
+    el("liveFeedRows").innerHTML = `<tr><td colspan="7">No live data yet</td></tr>`;
+    drawLiveFeedChart([]);
+    return;
+  }
+
+  const isReplay = s.mode === "replay";
+  badge.textContent = s.connected
+    ? (isReplay ? `Streaming ${s.speed_multiplier}×` : "Live")
+    : (s.error ? "Error" : "Done");
+  badge.className = `live-badge ${s.connected ? (isReplay ? "streaming" : "live") : ""}`;
+
+  el("liveModeBadge").textContent = s.mode;
+  el("liveEventCount").textContent = s.events_ingested;
+  el("liveEventRate").textContent = `${num(s.events_per_second, 1)}/s`;
+  el("liveLatestLap").textContent = s.latest_lap || "—";
+  el("liveLapTime").textContent = s.latest_lap_time_s != null
+    ? `${num(s.latest_lap_time_s, 3)}s`
+    : "—";
+  el("liveCompound").textContent = s.current_compound || "—";
+  el("liveProgress").textContent = isReplay
+    ? `${num(s.progress_pct, 0)}%`
+    : (s.message_count ? `${s.message_count} msg` : "—");
+  el("liveMessages").textContent = s.message_count || "—";
+  el("liveFeedBand").textContent = s.session_id
+    ? `${s.session_id} · ${s.driver}`
+    : "Waiting";
+
+  if (s.error) {
+    el("liveError").hidden = false;
+    el("liveError").textContent = s.error;
+  } else {
+    el("liveError").hidden = true;
+  }
+
+  renderLiveFeedRows();
+  drawLiveFeedChart(state.livePredictions);
+}
+
+function renderLiveFeedRows() {
+  const rows = el("liveFeedRows");
+  const predictions = state.livePredictions.slice().reverse().slice(0, 24);
+  rows.innerHTML = "";
+  if (!predictions.length) {
+    rows.innerHTML = `<tr><td colspan="7">No predictions yet</td></tr>`;
+    return;
+  }
+  for (const p of predictions) {
+    const row = document.createElement("tr");
+    row.innerHTML = `
+      <td>${p.lap}</td>
+      <td>—</td>
+      <td>${num(p.tire_wear_pct, 1)}%</td>
+      <td class="${riskClass(p.cliff_probability)}">${pct(p.cliff_probability)}</td>
+      <td>${num(p.next_lap_delta_s, 3)}s</td>
+      <td>${num(p.ers_efficiency, 2)}</td>
+      <td>${p.model_backend || "—"}</td>
+    `;
+    rows.appendChild(row);
+  }
+}
+
+function drawLiveFeedChart(predictions) {
+  const canvas = el("liveFeedChart");
+  if (!canvas) return;
+  const rows = predictions.slice(-60).map((p) => ({
+    wear: p.tire_wear_pct,
+    cliff: p.cliff_probability * 100,
+    delta: p.next_lap_delta_s * 20,
+  }));
+  el("liveFeedBand").textContent = rows.length
+    ? `${rows.length} predictions`
+    : "Waiting";
+  drawLineChart(canvas, rows, [
+    { key: "wear", label: "Wear %", color: "#ff6b6b", fixedMax: 100, unit: "%" },
+    { key: "cliff", label: "Cliff %", color: "#f5c45c", fixedMax: 100, unit: "%" },
+    { key: "delta", label: "Δ ×20", color: "#49c6d1", fixedMax: 100, unit: "" },
+  ], { xLabel: "Predictions", yUnit: "%" });
+}
+
+async function promoteShadowChallenger() {
+  const c = state.shadow?.promotion_candidate;
+  if (!c) {
+    setNotice("No promotion candidate available yet.", "error");
+    return;
+  }
+  try {
+    el("shadowPromoteViewBtn").disabled = true;
+    const result = await api("/shadow/promote", { method: "POST" });
+    state.shadow = { active: false, challenger_backend: "none", total_predictions: 0, recent: [] };
+    setNotice(
+      `Promoted ${result.challenger_backend} → champion. ` +
+      `Improvement: ${num(result.improvement_s * 1000, 0)}ms (${num(result.improvement_pct, 1)}%). ` +
+      `Active: ${result.active_artifact_id}`
+    );
+    await refreshHealth();
+    await refreshArtifacts();
+    renderShadow();
+  } catch (error) {
+    setNotice(`Promotion failed: ${error.message}`, "error");
+  } finally {
+    el("shadowPromoteViewBtn").disabled = false;
+  }
+}
+
+function populateTrainingRealDataSelect() {
+  const select = el("trainingRealDataSelect");
+  const prevSelected = new Set(
+    Array.from(select.selectedOptions).map((o) => o.value)
+  );
+  select.innerHTML = "";
+  for (const dataset of state.replayDatasets || []) {
+    const opt = document.createElement("option");
+    opt.value = dataset.path;
+    opt.textContent = dataset.path;
+    if (prevSelected.has(dataset.path)) opt.selected = true;
+    select.appendChild(opt);
+  }
+}
+
+async function runTraining() {
+  const baselapRaw = el("trainingBaselapInput").value.trim();
+  const selectedPaths = Array.from(el("trainingRealDataSelect").selectedOptions).map((o) => o.value);
+  const payload = {
+    backend: el("trainingBackendSelect").value,
+    laps: Number(el("trainingLapsInput").value || 28),
+    seeds: Number(el("trainingSeedsInput").value || 64),
+    rounds: Number(el("trainingRoundsInput").value || 140),
+    base_lap_time_s: baselapRaw ? Number(baselapRaw) : null,
+    real_data: selectedPaths.length ? selectedPaths : null,
+    use_mlflow: el("trainingMlflowInput").checked,
+    register_artifact: el("trainingRegisterInput").checked,
+  };
+  try {
+    el("trainingRunButton").disabled = true;
+    el("trainingState").textContent = "Starting…";
+    const result = await api("/training/run", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    state.activeTrainingJobId = result.job_id;
+    setNotice(`Training job started: ${result.job_id} (${result.backend})`);
+    scheduleTrainingPoll();
+  } catch (error) {
+    el("trainingRunButton").disabled = false;
+    el("trainingState").textContent = "Error";
+    setNotice(`Could not start training: ${error.message}`, "error");
+  }
+}
+
+function scheduleTrainingPoll() {
+  clearTimeout(state.trainingPollTimer);
+  if (!state.activeTrainingJobId) return;
+  state.trainingPollTimer = setTimeout(async () => {
+    try {
+      const jobs = await api("/training/jobs");
+      state.trainingJobs = jobs.jobs || [];
+      renderTrainingJobs();
+      const active = state.trainingJobs.find((j) => j.job_id === state.activeTrainingJobId);
+      if (active?.status === "running") {
+        scheduleTrainingPoll();
+      } else {
+        el("trainingRunButton").disabled = false;
+        if (active?.status === "done") {
+          setNotice(
+            `Training complete: ${active.backend}` +
+            (active.artifact_id ? ` · artifact: ${active.artifact_id}` : "")
+          );
+          await refreshArtifacts();
+        } else if (active?.status === "error") {
+          setNotice(`Training failed: ${active.error}`, "error");
+          el("trainingState").textContent = "Error";
+        }
+        state.activeTrainingJobId = null;
+      }
+    } catch (_err) {
+      scheduleTrainingPoll();
+    }
+  }, 2000);
+}
+
+function renderTrainingJobs() {
+  const jobs = state.trainingJobs || [];
+  const list = el("trainingJobList");
+  list.innerHTML = "";
+  const active = jobs.find((j) => j.job_id === state.activeTrainingJobId);
+  el("trainingState").textContent = active
+    ? `${active.backend} running…`
+    : jobs.length ? `${jobs.length} job(s)` : "Idle";
+  if (!jobs.length) {
+    list.innerHTML = `<div class="training-job-item"><span>No training jobs yet</span></div>`;
+    return;
+  }
+  for (const job of jobs.slice(0, 6)) {
+    const item = document.createElement("div");
+    const statusClass = job.status === "done" ? "pass" : job.status === "error" ? "fail" : "running";
+    item.className = `training-job-item ${statusClass}`;
+    const elapsed = job.completed_at
+      ? `${num((job.completed_at - job.started_at), 0)}s`
+      : "…";
+    item.innerHTML = `
+      <div class="training-job-head">
+        <strong>${job.backend}</strong>
+        <span class="training-job-id">${job.job_id}</span>
+        <span class="training-job-status">${job.status}</span>
+        <span class="training-job-elapsed">${elapsed}</span>
+      </div>
+      ${job.artifact_id ? `<div class="training-job-artifact" title="${job.artifact_id}">artifact: ${shortRunId(job.artifact_id)}</div>` : ""}
+      ${job.error ? `<div class="training-job-error">${job.error}</div>` : ""}
+      ${(job.log || []).slice(-2).map((line) => `<div class="training-job-log">${line}</div>`).join("")}
+    `;
+    list.appendChild(item);
+  }
+}
+
+el("shadowEnableButton").addEventListener("click", enableShadow);
+el("shadowDisableButton").addEventListener("click", disableShadow);
+el("shadowPromoteViewBtn").addEventListener("click", promoteShadowChallenger);
+el("trainingRunButton").addEventListener("click", runTraining);
+el("validateDatasetButton").addEventListener("click", runReplayCheck);
+el("replayRunButton").addEventListener("click", runReplayCheck);
+el("regressionRunButton").addEventListener("click", runRegressionCheck);
+el("replayModeBtn").addEventListener("click", () => setLiveMode("replay"));
+el("liveModeBtn").addEventListener("click", () => setLiveMode("live"));
+el("liveReplayStartBtn").addEventListener("click", startLiveReplay);
+el("liveStopBtn").addEventListener("click", stopLiveData);
+el("liveTimingStartBtn").addEventListener("click", startLiveTiming);
+el("liveTimingStopBtn").addEventListener("click", stopLiveData);
 el("liveTabButton").addEventListener("click", () => setActiveTab("live"));
 el("historyTabButton").addEventListener("click", () => setActiveTab("history"));
 el("opsTabButton").addEventListener("click", () => setActiveTab("ops"));
@@ -1242,7 +2435,10 @@ refreshHealth();
 refreshModels();
 refreshMetrics().catch(() => {});
 refreshOps().catch(() => {});
+refreshBenchmark().catch(() => {});
 refreshHistory();
+refreshExternalLinks();
 setControls();
 setInterval(refreshHealth, 3000);
 setInterval(refreshOps, 5000);
+setInterval(refreshExternalLinks, 30000);

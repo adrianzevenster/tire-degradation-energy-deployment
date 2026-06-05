@@ -17,13 +17,24 @@ class RegressionResult:
     threshold: float
 
 
+@dataclass(frozen=True)
+class RegressionConfig:
+    laps: int = 18
+    seed: int = 11
+    target_latency_ms: float | None = None
+    max_temporal_oscillation_s: float | None = None
+    min_calibration_width_s: float = 0.20
+    max_calibration_width_s: float | None = None
+
+
 class RegressionSuite:
-    def __init__(self, settings: Settings | None = None) -> None:
+    def __init__(self, settings: Settings | None = None, config: RegressionConfig | None = None) -> None:
         self.settings = settings or load_settings()
+        self.config = config or RegressionConfig()
 
     def run(self) -> list[RegressionResult]:
         engine = InferenceEngine(persistence=NullPersistence())
-        simulator = RaceSimulator(SimulationConfig(laps=18, seed=11))
+        simulator = RaceSimulator(SimulationConfig(laps=self.config.laps, seed=self.config.seed))
         predictions = [engine.ingest(event) for event in simulator.events()]
         lap_predictions = [p for index, p in enumerate(predictions, start=1) if index % 3 == 0]
         deltas = [p.next_lap_delta_s for p in lap_predictions]
@@ -44,21 +55,39 @@ class RegressionSuite:
         return [
             RegressionResult(
                 "latency_p95_ms",
-                latency_p95 <= self.settings.target_latency_ms,
+                latency_p95 <= (
+                    self.config.target_latency_ms
+                    if self.config.target_latency_ms is not None
+                    else self.settings.target_latency_ms
+                ),
                 latency_p95,
-                self.settings.target_latency_ms,
+                self.config.target_latency_ms
+                if self.config.target_latency_ms is not None
+                else self.settings.target_latency_ms,
             ),
             RegressionResult(
                 "temporal_stability_s",
-                stability <= self.settings.max_temporal_oscillation_s,
+                stability <= (
+                    self.config.max_temporal_oscillation_s
+                    if self.config.max_temporal_oscillation_s is not None
+                    else self.settings.max_temporal_oscillation_s
+                ),
                 stability,
-                self.settings.max_temporal_oscillation_s,
+                self.config.max_temporal_oscillation_s
+                if self.config.max_temporal_oscillation_s is not None
+                else self.settings.max_temporal_oscillation_s,
             ),
             RegressionResult(
                 "calibration_interval_width_s",
-                0.20 <= calibration_width <= self.settings.max_calibration_width_s,
+                self.config.min_calibration_width_s <= calibration_width <= (
+                    self.config.max_calibration_width_s
+                    if self.config.max_calibration_width_s is not None
+                    else self.settings.max_calibration_width_s
+                ),
                 calibration_width,
-                self.settings.max_calibration_width_s,
+                self.config.max_calibration_width_s
+                if self.config.max_calibration_width_s is not None
+                else self.settings.max_calibration_width_s,
             ),
             RegressionResult(
                 "monotonic_wear_violations",

@@ -19,6 +19,7 @@ python -m f1_strategy.cli --laps 8
 python -m f1_strategy.cli --version
 python -m f1_strategy.evaluation --format markdown
 python -m f1_strategy.replay --dataset examples/replay_telemetry.csv
+python -m f1_strategy.replay --benchmark
 python -m unittest discover -s tests
 ```
 
@@ -38,6 +39,8 @@ Common workflows are also available through `make`:
 make test
 make regression
 make replay-evaluate
+make replay-benchmark
+make export-fastf1-replay FASTF1_YEAR=2024 FASTF1_EVENT=Bahrain FASTF1_SESSION=R FASTF1_DRIVER=VER
 make reports
 make ci
 make train MODEL_BACKEND=xgboost MODEL_OUTPUT=models/xgboost_lap_delta.json
@@ -116,23 +119,25 @@ the resulting artifact, and writes an immutable local bundle under
 
 - the model artifact
 - `manifest.json`
+- `model_card.json`
 - `training_config.json`
 - `evaluation.json`
 - `evaluation.md`
 - `replay_evaluation.json`
+- `replay_suite.json`
 
 The bundle manifest records artifact ID, git SHA, training parameters, feature schema
 hash, simulated data fingerprint, replay dataset fingerprint, simulator evaluation
-metrics, and replay holdout metrics. The local `artifacts/models/registry.json`
-index tracks candidate artifacts and promoted artifacts. Generated artifacts stay
-out of Git by default.
+metrics, replay holdout metrics, and committed benchmark replay-suite metrics. The
+local `artifacts/models/registry.json` index tracks candidate artifacts and
+promoted artifacts. Generated artifacts stay out of Git by default.
 
 Promotion is a separate gate-checked step. `make promote-artifact ARTIFACT_ID=...`
 validates that the manifest is complete, the model file and evaluation report exist,
 the feature schema hash matches serving code, mean MAE and coverage satisfy thresholds,
-p95 latency is within budget, monotonic tire-wear violations are zero, and replay
-holdout gates pass. Successful promotion updates both the artifact manifest and
-`registry.json`.
+p95 latency is within budget, monotonic tire-wear violations are zero, replay
+holdout gates pass, and the `benchmark` replay suite has at least five passing
+slices. Successful promotion updates both the artifact manifest and `registry.json`.
 
 If model files already exist under `models/` but are not in the artifact registry,
 register them as versioned candidates with:
@@ -203,7 +208,8 @@ The API exposes persisted run summaries through `GET /history/runs`, and the bro
 UI uses that endpoint to compare recent simulation runs.
 
 CI gates run the regression suite to protect latency, temporal stability, uncertainty
-width, and monotonic tire-wear behavior.
+width, and monotonic tire-wear behavior. CI also runs the committed replay benchmark
+suite so model changes are checked against fixed slice-level telemetry fixtures.
 
 ## Evaluation Reports
 
@@ -230,12 +236,102 @@ act as a promotion gate. Run:
 
 ```bash
 python -m f1_strategy.replay --dataset examples/replay_telemetry.csv
+python -m f1_strategy.replay --suite
+python -m f1_strategy.replay --benchmark
+python -m f1_strategy.replay --check-benchmark-manifests
 ```
 
 The replay report records the dataset fingerprint, session/event counts, labeled
 row count, target completeness, MAE/RMSE, coverage, p95 latency, monotonic wear
 violations, and pass/fail gates. The API exposes the same report at
 `GET /evaluation/replay`.
+
+Replay reports also include `data_provenance`, which drives the API and UI trust
+badges:
+
+- `Production`: replay manifest has observed public lap-time labels and enough
+  observed validation fields to support production replay validation.
+- `Benchmark`: committed deterministic benchmark fixture with a sidecar manifest.
+  These slices protect development and promotion smoke gates but are not observed
+  production validation data.
+- `Synthetic`: generated simulator split or synthetic lap-time label.
+- `Proxy`: manifested data whose validation fields are proxy-heavy or whose lap
+  labels are not observed.
+- `No Manifest`: replay data without a sidecar manifest, so field provenance cannot
+  be verified.
+
+Default smoke and benchmark gates remain deterministic development gates. For
+production promotion, use provenance-backed replay datasets so observed lap-time,
+compound, weather, speed, throttle, and brake signals drive release decisions while
+derived private channels stay diagnostics.
+
+`--suite` runs deterministic smoke splits. `--benchmark` runs committed CSV fixtures
+under `examples/replay_benchmarks/` across medium long-run, soft hot-track, hard
+fuel-burn, intermediate wet-track, and dirty-air traffic slices. These benchmark
+splits use per-slice gate thresholds and must pass for artifact promotion. The API
+exposes the benchmark suite at `GET /evaluation/replay-benchmark`.
+
+Benchmark fixture sidecar manifests are deterministic and checked in. Regenerate or
+validate them with:
+
+```bash
+python -m f1_strategy.replay --write-benchmark-manifests
+python -m f1_strategy.replay --check-benchmark-manifests
+make replay-manifest-check
+```
+
+## Real Replay Data
+
+Install the optional data extra to export public FastF1 sessions into the replay
+schema:
+
+```bash
+pip install -e ".[data]"
+python -m f1_strategy.data_sources.fastf1_export \
+  --year 2024 \
+  --event Bahrain \
+  --session R \
+  --driver VER \
+  --output data/fastf1-bahrain-2024-ver-race.csv \
+  --cache-dir data/fastf1-cache
+
+python -m f1_strategy.replay --dataset data/fastf1-bahrain-2024-ver-race.csv
+```
+
+The same workflow is available through `make export-fastf1-replay`. The exporter
+writes a sidecar manifest next to the CSV, for example
+`data/fastf1-bahrain-2024-ver-race.csv.manifest.json`. The manifest records the
+FastF1 source session, dataset fingerprint, row count, and field provenance.
+
+When the API service is running, the same workflow is available through:
+
+- `POST /data-sources/fastf1/export`
+- `GET /data-sources/replay-datasets`
+- `GET /data-sources/replay-datasets/{dataset_path}/manifest`
+- `GET /evaluation/replay?dataset_path=data/fastf1-bahrain-2024-ver-race.csv`
+
+The Operations UI includes a Replay Data Sources panel for exporting FastF1 data,
+selecting replay datasets, inspecting manifest provenance, and validating the
+selected dataset against the replay gates.
+
+Public F1 data does not expose private team channels such as true tire
+temperatures, brake temperatures, ERS state of charge, fuel load, slip angle, or
+tire wear. The exporter fills those fields with deterministic proxies so the data
+can pass through the existing inference and replay interfaces, but the manifest
+marks them as derived. Treat observed fields such as speed, throttle, brake, lap
+time, compound, and weather as validation signal; do not treat derived private
+channels as ground-truth labels.
+
+Artifact promotion can enforce this distinction:
+
+```bash
+make promote-artifact ARTIFACT_ID=xgboost/2026-05-31T120102Z-abc1234 \
+  EXTRA_ARGS="--require-production-replay-validation"
+```
+
+Or call the artifact CLI directly with
+`--require-production-replay-validation`. The strict gate rejects artifacts whose
+replay reports are simulator-only, missing manifests, or proxy-heavy.
 
 ## API Service
 
@@ -272,6 +368,13 @@ payloads, such as out-of-range sector, throttle, brake, ERS state of charge, or
 humidity values, are rejected at the HTTP boundary with FastAPI validation errors.
 `GET /health` includes the active model backend, feature schema version, and feature
 schema hash for deployment inspection.
+
+`GET /deployment/readiness` defaults to local/demo readiness. Use
+`GET /deployment/readiness?mode=production` to require a promoted artifact and
+production-ready replay validation. The Operations UI uses production mode for the
+main readiness badge and shows replay validation signal, observed field counts,
+proxy field counts, and production-validation readiness in the replay and artifact
+panels.
 
 ## Environment And Monitoring
 
@@ -315,6 +418,14 @@ Services:
 - Live UI: http://localhost:8000
 - Prometheus: http://localhost:9090
 - Grafana: http://localhost:3000, login `admin` / `admin`
+
+The Live UI reads browser-facing integration links from the API instead of hard-coding them. Override these when the app is behind a tunnel, reverse proxy, or remote host:
+
+```bash
+F1_MLFLOW_UI_URL=http://localhost:5000
+F1_GRAFANA_URL=http://localhost:3000
+F1_PROMETHEUS_URL=http://localhost:9090
+```
 
 Metrics cover:
 

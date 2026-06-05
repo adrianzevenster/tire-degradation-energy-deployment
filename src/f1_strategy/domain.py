@@ -40,6 +40,7 @@ class TelemetryEvent:
     compound: TireCompound
     lap_time_s: float | None = None
     timestamp_ms: int = field(default_factory=lambda: int(time() * 1000))
+    circuit: str = ""
 
 
 @dataclass(frozen=True)
@@ -48,6 +49,7 @@ class OnlineFeatures:
     car_id: str
     lap: int
     compound: TireCompound
+    circuit: str
     tire_age_laps: int
     mean_tire_temp: float
     tire_temp_gradient: float
@@ -62,6 +64,7 @@ class OnlineFeatures:
     fuel_kg: float
     rolling_lap_time_s: float
     dirty_air_risk: float
+    circuit_base_lap_s: float = 90.0
 
 
 @dataclass(frozen=True)

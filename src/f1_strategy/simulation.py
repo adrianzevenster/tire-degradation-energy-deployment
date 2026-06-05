@@ -15,6 +15,7 @@ class SimulationConfig:
     seed: int = 7
     compound: TireCompound = TireCompound.MEDIUM
     base_lap_time_s: float = 90.0
+    circuit: str = "synthetic"
 
 
 class RaceSimulator:
@@ -49,6 +50,7 @@ class RaceSimulator:
                     TelemetryEvent(
                         session_id=self.config.session_id,
                         car_id=self.config.car_id,
+                        circuit=self.config.circuit,
                         lap=lap,
                         sector=sector,
                         speed_kph=235.0 + self._rng.uniform(-18.0, 22.0),

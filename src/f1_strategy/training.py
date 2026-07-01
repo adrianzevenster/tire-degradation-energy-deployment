@@ -5,6 +5,7 @@ import csv
 import json
 from dataclasses import replace as _replace
 from pathlib import Path
+from typing import Any
 
 from f1_strategy.artifacts import DEFAULT_ARTIFACT_ROOT, create_model_artifact_bundle
 from f1_strategy.config import Settings, load_settings
@@ -673,19 +674,19 @@ def _mlflow_log_metrics(
         pass
 
 
-def _compute_feature_importance(model: object, backend: str) -> dict[str, float]:
+def _compute_feature_importance(model: Any, backend: str) -> dict[str, float]:
     """Return {feature_name: gain_score} from the trained booster."""
     try:
         if backend == "xgboost":
-            raw = model.get_score(importance_type="gain")  # type: ignore[union-attr]
+            raw = model.get_score(importance_type="gain")
             return {k: float(v) for k, v in raw.items()}
         if backend == "lightgbm":
-            scores = model.feature_importance(importance_type="gain")  # type: ignore[union-attr]
-            names = model.feature_name()  # type: ignore[union-attr]
+            scores = model.feature_importance(importance_type="gain")
+            names = model.feature_name()
             return {name: float(score) for name, score in zip(names, scores)}
         if backend == "catboost":
-            scores = model.get_feature_importance()  # type: ignore[union-attr]
-            names = model.feature_names_  # type: ignore[union-attr]
+            scores = model.get_feature_importance()
+            names = model.feature_names_
             return {name: float(score) for name, score in zip(names, scores)}
     except Exception:
         pass

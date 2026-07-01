@@ -16,6 +16,8 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 
+RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
+
 RUN pip install --no-cache-dir -e ".[api,observability,persistence,ml]"
 
 EXPOSE 8000

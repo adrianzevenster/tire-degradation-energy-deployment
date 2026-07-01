@@ -254,6 +254,17 @@ class InferenceEngine:
             model_artifact_id=self._active_model_artifact_id(),
         )
 
+    def update_fleet_state(self, fleet_state: object) -> None:
+        """Attach live fleet gap data to the feature store before the next ingest cycle."""
+        if hasattr(self.feature_store, "set_fleet_state"):
+            self.feature_store.set_fleet_state(fleet_state)
+
+    def feature_importance(self) -> dict[str, float]:
+        """Return feature importance scores from the active model, or {} if unavailable."""
+        if hasattr(self.model, "feature_importance"):
+            return self.model.feature_importance()
+        return {}
+
     def _record_observed_lap(self, event: TelemetryEvent, prediction: Prediction) -> None:
         assert event.lap_time_s is not None
         actual_lap_delta_s = event.lap_time_s - self.settings.base_lap_time_s

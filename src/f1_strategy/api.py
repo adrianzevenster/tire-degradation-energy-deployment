@@ -21,6 +21,11 @@ from f1_strategy.data_sources.openf1_export import (
     OpenF1ExportConfig,
     export_openf1_session,
 )
+from f1_strategy.data_sources.openf1_intervals import (
+    FleetIntervalsExportConfig,
+    export_fleet_intervals,
+    fleet_intervals_path_for,
+)
 from f1_strategy.deployment import load_registry
 from f1_strategy.engine import InferenceEngine
 from f1_strategy.live import LiveSimulationManager
@@ -70,6 +75,17 @@ MODEL_BACKENDS = [
     "catboost",
     "sequence",
     "river",
+]
+
+MODEL_BACKEND_METADATA = [
+    {"name": "auto", "label": "Auto", "role": "serving", "trainable": False, "description": "Artifact fallback and auto selection."},
+    {"name": "hybrid", "label": "Hybrid", "role": "serving", "trainable": False, "description": "Online ensemble serving mode."},
+    {"name": "kalman", "label": "Kalman", "role": "serving", "trainable": False, "description": "Kalman filter serving mode."},
+    {"name": "xgboost", "label": "XGBoost", "role": "trainable", "trainable": True, "description": "Gradient-boosted regression training backend."},
+    {"name": "lightgbm", "label": "LightGBM", "role": "trainable", "trainable": True, "description": "Gradient-boosted regression training backend."},
+    {"name": "catboost", "label": "CatBoost", "role": "trainable", "trainable": True, "description": "Gradient-boosted regression training backend."},
+    {"name": "sequence", "label": "Sequence", "role": "trainable", "trainable": True, "description": "TorchScript sequence training backend."},
+    {"name": "river", "label": "River", "role": "serving", "trainable": False, "description": "Online incremental serving mode."},
 ]
 
 try:
@@ -153,6 +169,12 @@ try:
         session: str = Field(default="Race", min_length=1, examples=["Race"])
         driver: str = Field(..., min_length=1, examples=["VER"])
 
+    class OpenF1FleetExportRequest(BaseModel):
+        year: int = Field(..., ge=2018, le=2100, examples=[2024])
+        event: str = Field(..., min_length=1, examples=["Bahrain"])
+        session: str = Field(default="Race", min_length=1, examples=["Race"])
+        output: str | None = Field(default=None, examples=["data/openf1-2024-bahrain-race.csv.intervals.csv"])
+
     class StatusResponse(BaseModel):
         status: str
 
@@ -168,6 +190,7 @@ try:
         use_mlflow: bool = Field(default=False)
         register_artifact: bool = Field(default=True)
         base_lap_time_s: float | None = Field(default=None, ge=60.0, le=200.0, examples=[96.0])
+        replay_dataset_path: str = Field(default=str(DEFAULT_REPLAY_DATASET), min_length=1)
 
         @field_validator("real_data", mode="before")
         @classmethod
@@ -180,6 +203,59 @@ try:
         if hasattr(model, "model_dump"):
             return model.model_dump(exclude_none=True)
         return model.dict(exclude_none=True)
+
+    _run_checks_store = Path("data/run-checks.json")
+    _run_checks_lock = threading.Lock()
+    _run_checks_history_limit = 12
+
+    def _default_run_checks_state() -> dict:
+        return {
+            "latest": {"replay": None, "regression": None, "smoke": None},
+            "history": {"replay": [], "regression": [], "smoke": []},
+        }
+
+    def _load_run_checks_state() -> dict:
+        if not _run_checks_store.exists():
+            return _default_run_checks_state()
+        try:
+            payload = json.loads(_run_checks_store.read_text(encoding="utf-8"))
+        except Exception:
+            return _default_run_checks_state()
+        state = _default_run_checks_state()
+        if isinstance(payload, dict):
+            latest = payload.get("latest", {})
+            history = payload.get("history", {})
+            if isinstance(latest, dict):
+                for key in state["latest"]:
+                    if key in latest:
+                        state["latest"][key] = latest[key]
+            if isinstance(history, dict):
+                for key in state["history"]:
+                    if isinstance(history.get(key), list):
+                        state["history"][key] = history[key][- _run_checks_history_limit :]
+        return state
+
+    def _save_run_checks_state(state: dict) -> None:
+        _run_checks_store.parent.mkdir(parents=True, exist_ok=True)
+        _run_checks_store.write_text(
+            json.dumps(state, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+
+    def _record_run_check(kind: str, payload: dict) -> dict:
+        with _run_checks_lock:
+            state = _load_run_checks_state()
+            entry = {
+                "kind": kind,
+                "recorded_at": _time(),
+                **payload,
+            }
+            state["latest"][kind] = entry
+            history = state["history"].setdefault(kind, [])
+            history.append(entry)
+            state["history"][kind] = history[-_run_checks_history_limit :]
+            _save_run_checks_state(state)
+            return state
 
     def _probe_service(url: str, timeout_s: float = 0.35) -> str:
         if not url:
@@ -280,7 +356,7 @@ try:
         }
 
     @app.get("/models")
-    def models() -> dict[str, list[str] | str]:
+    def models() -> dict[str, object]:
         return {
             "active_backend": getattr(
                 engine.model,
@@ -290,6 +366,9 @@ try:
             "configured_backend": engine.settings.model_backend,
             "active_artifact_id": engine.settings.model_artifact_id or "unregistered",
             "available_backends": MODEL_BACKENDS,
+            "backend_catalog": MODEL_BACKEND_METADATA,
+            "trainable_backends": [item["name"] for item in MODEL_BACKEND_METADATA if item["trainable"]],
+            "serving_backends": [item["name"] for item in MODEL_BACKEND_METADATA if not item["trainable"]],
         }
 
     @app.get("/artifacts")
@@ -311,6 +390,35 @@ try:
             )
         except Exception as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+    @app.post("/artifacts/{artifact_id:path}/promote")
+    def artifact_promote(artifact_id: str, force: bool = False) -> dict:
+        from f1_strategy.artifacts import PromotionGateConfig, promote_artifact
+        gates = (
+            PromotionGateConfig(
+                max_mean_mae_lap_delta_s=99.0,
+                max_replay_mae_lap_delta_s=99.0,
+                min_replay_coverage_pct=0.0,
+                require_replay_evaluation=False,
+                require_replay_suite=False,
+            )
+            if force
+            else PromotionGateConfig()
+        )
+        try:
+            result = promote_artifact(
+                artifact_id=artifact_id,
+                artifact_root=engine.settings.model_artifact_root,
+                gates=gates,
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        if not result.promoted:
+            raise HTTPException(
+                status_code=422,
+                detail={"promoted": False, "failures": result.failures},
+            )
+        return {"promoted": True, "artifact_id": result.artifact_id, "failures": []}
 
     @app.post("/model/backend")
     def model_backend(backend: str) -> dict[str, str]:
@@ -446,9 +554,15 @@ try:
         min_calibration_width_s: float = Field(default=0.20, ge=0.0)
         max_calibration_width_s: float | None = Field(default=None, ge=0.0)
 
+    class SmokeRunRequest(BaseModel):
+        replay_dataset_path: str = Field(default=str(DEFAULT_REPLAY_DATASET), min_length=1)
+        regression_laps: int = Field(default=18, ge=1, le=200)
+        regression_seed: int = Field(default=11, ge=1, le=9999)
+        probe_external_links: bool = Field(default=False)
+
     def _stream_status_dict() -> dict:
         s = live_stream.status()
-        return {
+        status: dict = {
             "mode": s.mode,
             "connected": s.connected,
             "session_id": s.session_id,
@@ -463,7 +577,31 @@ try:
             "speed_multiplier": s.speed_multiplier,
             "progress_pct": s.progress_pct,
             "error": s.error,
+            "latest_prediction": None,
         }
+        snapshots = engine.feature_store.snapshot()
+        if snapshots:
+            features = snapshots[-1]
+            try:
+                pred = engine._annotate_prediction(engine.model.predict(features))
+                status["latest_prediction"] = {
+                    "session_id": pred.session_id,
+                    "car_id": pred.car_id,
+                    "lap": pred.lap,
+                    "sector": None,
+                    "tire_wear_pct": round(pred.tire_wear_pct, 3),
+                    "cliff_probability": round(pred.cliff_probability, 4),
+                    "next_lap_delta_s": round(pred.next_lap_delta_s, 4),
+                    "uncertainty_low_s": round(pred.uncertainty_low_s, 4),
+                    "uncertainty_high_s": round(pred.uncertainty_high_s, 4),
+                    "ers_efficiency": round(pred.ers_efficiency, 4),
+                    "model_backend": pred.model_backend,
+                    "model_artifact_id": pred.model_artifact_id,
+                    "compound": features.compound.value,
+                }
+            except Exception:
+                pass
+        return status
 
     @app.post("/live-data/replay/start")
     def live_replay_start(payload: ReplayStartRequest) -> dict:
@@ -513,6 +651,23 @@ try:
     @app.get("/monitoring/model-comparison")
     def model_comparison() -> dict[str, list[dict]]:
         return {"models": engine.model_comparison()}
+
+    @app.get("/monitoring/feature-importance")
+    def monitoring_feature_importance() -> dict:
+        raw = engine.feature_importance()
+        backend = engine._active_model_backend()
+        if not raw:
+            return {"backend": backend, "available": False, "importance": []}
+        total = sum(raw.values()) or 1.0
+        ranked = sorted(raw.items(), key=lambda x: -x[1])
+        return {
+            "backend": backend,
+            "available": True,
+            "importance": [
+                {"rank": i + 1, "name": name, "score": round(score, 4), "pct": round(score / total * 100, 2)}
+                for i, (name, score) in enumerate(ranked)
+            ],
+        }
 
     @app.get("/monitoring/alerts")
     def monitoring_alerts() -> dict:
@@ -582,6 +737,22 @@ try:
             "persistence_backend": getattr(engine.persistence, "backend_name", "unknown"),
             "runs": engine.persistence.run_summaries(limit=limit),
         }
+
+    @app.post("/data/export")
+    def data_export(output_dir: str = "data/exports") -> dict:
+        if not hasattr(engine.persistence, "export_parquet"):
+            raise HTTPException(
+                status_code=503,
+                detail="Parquet export requires DuckDB persistence backend.",
+            )
+        try:
+            exported = engine.persistence.export_parquet(output_dir)
+            return {
+                "output_dir": output_dir,
+                "tables": {name: str(path) for name, path in exported.items()},
+            }
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
 
     @app.post("/telemetry")
     def ingest(payload: TelemetryEventRequest) -> dict:
@@ -678,6 +849,26 @@ try:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return manifest
 
+    @app.post("/data-sources/openf1/fleet-export")
+    def openf1_fleet_export(payload: OpenF1FleetExportRequest) -> dict:
+        request = _payload(payload)
+        year = int(request["year"])
+        event = str(request["event"])
+        session = str(request["session"])
+        circuit_slug = event.strip().lower().replace(" ", "-")
+        session_slug = session.strip().lower()
+        default_output = f"data/openf1-{year}-{circuit_slug}-{session_slug}.csv.intervals.csv"
+        output = _safe_data_output_path(request.get("output") or default_output)
+        try:
+            manifest = export_fleet_intervals(
+                FleetIntervalsExportConfig(
+                    year=year, event=event, session=session, output=output
+                )
+            )
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        return manifest
+
     @app.get("/evaluation/replay-suite")
     def replay_suite() -> dict:
         try:
@@ -694,19 +885,39 @@ try:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         return replay_suite_to_dict(report)
 
+    @app.get("/ops/run-checks")
+    def run_checks_status() -> dict:
+        with _run_checks_lock:
+            return _load_run_checks_state()
+
+    @app.get("/ops")
+    def ops() -> dict:
+        with _run_checks_lock:
+            return {
+                "run_checks": _load_run_checks_state(),
+                "health": health(),
+                "models": models(),
+            }
+
     @app.post("/evaluation/replay/run")
     def replay_run(payload: ReplayRunRequest) -> dict:
         kind = payload.kind.strip().lower()
         try:
             if kind == "dataset":
                 report = run_replay_evaluation(_safe_dataset_path(payload.dataset_path), engine=engine)
-                return {"kind": kind, "report": replay_report_to_dict(report)}
+                result = {"kind": kind, "report": replay_report_to_dict(report)}
+                _record_run_check("replay", result)
+                return result
             if kind == "suite":
                 report = run_replay_suite()
-                return {"kind": kind, "suite": replay_suite_to_dict(report)}
+                result = {"kind": kind, "suite": replay_suite_to_dict(report)}
+                _record_run_check("replay", result)
+                return result
             if kind == "benchmark":
                 report = run_benchmark_replay_suite()
-                return {"kind": kind, "suite": replay_suite_to_dict(report)}
+                result = {"kind": kind, "suite": replay_suite_to_dict(report)}
+                _record_run_check("replay", result)
+                return result
             raise HTTPException(status_code=400, detail="kind must be one of dataset, suite, benchmark")
         except HTTPException:
             raise
@@ -729,7 +940,7 @@ try:
             results = suite.run()
         except Exception as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
-        return {
+        result = {
             "passed": all(result.passed for result in results),
             "results": [
                 {
@@ -749,12 +960,111 @@ try:
                 "max_calibration_width_s": payload.max_calibration_width_s,
             },
         }
+        _record_run_check("regression", result)
+        return result
+
+    @app.post("/deployment/smoke")
+    def deployment_smoke(payload: SmokeRunRequest) -> dict:
+        try:
+            health_payload = health()
+            models_payload = models()
+            replay_report = run_replay_evaluation(_safe_dataset_path(payload.replay_dataset_path), engine=engine)
+            regression_results = RegressionSuite(
+                config=RegressionConfig(
+                    laps=payload.regression_laps,
+                    seed=payload.regression_seed,
+                )
+            ).run()
+            benchmark_report = run_benchmark_replay_suite()
+            registry = load_registry(engine.settings.model_artifact_root)
+            metrics_payload = engine.monitoring.render_prometheus()
+            external_links = _external_service_links(probe=payload.probe_external_links)
+
+            checks = [
+                {
+                    "name": "model_catalog",
+                    "passed": health_payload.get("model_backend") in models_payload.get("available_backends", []),
+                    "details": f"active={health_payload.get('model_backend')} configured={models_payload.get('configured_backend')}",
+                },
+                {
+                    "name": "replay_validation",
+                    "passed": bool(replay_report.passed),
+                    "details": replay_report.dataset_path,
+                },
+                {
+                    "name": "regression_suite",
+                    "passed": all(result.passed for result in regression_results),
+                    "details": f"{len(regression_results)} checks",
+                },
+                {
+                    "name": "benchmark_suite",
+                    "passed": bool(benchmark_report.passed),
+                    "details": f"{benchmark_report.split_count} splits",
+                },
+                {
+                    "name": "artifact_registry",
+                    "passed": bool(registry.get("artifacts")),
+                    "details": f"{len(registry.get('artifacts', []))} artifacts",
+                },
+                {
+                    "name": "health_endpoint",
+                    "passed": health_payload.get("status") == "ok",
+                    "details": f"latency_p95={health_payload.get('latency_p95_ms')}",
+                },
+                {
+                    "name": "metrics_exposure",
+                    "passed": bool(metrics_payload.strip()),
+                    "details": "/metrics",
+                },
+                {
+                    "name": "external_links",
+                    "passed": all(
+                        str(service.get("status")) in {"available", "configured"}
+                        for service in external_links
+                        if bool(service.get("external"))
+                    ),
+                    "details": ", ".join(
+                        f"{service['label']}:{service['status']}"
+                        for service in external_links
+                        if bool(service.get("external"))
+                    ),
+                },
+            ]
+            result = {
+                "passed": all(check["passed"] for check in checks),
+                "checks": checks,
+                "model_backend": health_payload.get("model_backend"),
+                "artifact_id": health_payload.get("model_artifact_id"),
+                "replay": replay_report_to_dict(replay_report),
+                "regression": {
+                    "passed": all(result.passed for result in regression_results),
+                    "results": [
+                        {
+                            "name": result.name,
+                            "passed": result.passed,
+                            "value": result.value,
+                            "threshold": result.threshold,
+                        }
+                        for result in regression_results
+                    ],
+                },
+                "benchmark": replay_suite_to_dict(benchmark_report),
+                "external_links": external_links,
+            }
+            _record_run_check("smoke", result)
+            return result
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     @app.post("/training/run")
     def training_run(payload: TrainingRequest) -> dict:
         valid_backends = ["xgboost", "lightgbm", "catboost", "sequence"]
         if payload.backend not in valid_backends:
             raise HTTPException(status_code=400, detail=f"backend must be one of {valid_backends}")
+        try:
+            replay_dataset = _safe_dataset_path(payload.replay_dataset_path)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         real_data_paths: list[str] | None = None
         if payload.real_data:
             try:
@@ -803,22 +1113,28 @@ try:
                     artifact_root = engine.settings.model_artifact_root
                     job["log"].append("Evaluating artifact bundle…")
                     training_cfg = _training_config(
-                        payload.backend, output_path, payload.laps, payload.seeds, payload.rounds,
+                        payload.backend,
+                        output_path,
+                        payload.laps,
+                        payload.seeds,
+                        payload.rounds,
                         real_data_paths=real_data_paths,
+                        replay_dataset_path=str(replay_dataset),
                     )
                     report = run_evaluation(
                         model_backend=payload.backend,
                         model_paths={payload.backend: str(output_path), "sequence": str(output_path)},
                     )
                     replay_report = run_replay_evaluation(
-                        str(DEFAULT_REPLAY_DATASET),
+                        str(replay_dataset),
                         engine=InferenceEngine(
                             model=_serving_model_for_artifact(payload.backend, output_path)
                         ),
                     )
                     replay_suite = run_benchmark_replay_suite(
-                        engine_factory=lambda: InferenceEngine(
-                            model=_serving_model_for_artifact(payload.backend, output_path)
+                        engine_factory=lambda base: InferenceEngine(
+                            model=_serving_model_for_artifact(payload.backend, output_path),
+                            settings=replace(load_settings(), base_lap_time_s=base),
                         )
                     )
                     bundle = create_model_artifact_bundle(
@@ -829,8 +1145,10 @@ try:
                         replay_evaluation_report=replay_report,
                         replay_suite_report=replay_suite,
                         artifact_root=artifact_root,
+                        replay_dataset=replay_dataset,
                     )
                     job["artifact_id"] = bundle.artifact_id
+                    job["replay_dataset_path"] = str(replay_dataset)
                     job["log"].append(f"Artifact registered: {bundle.artifact_id}")
                 job["status"] = "done"
                 job["completed_at"] = _time()
@@ -853,6 +1171,7 @@ try:
                     "started_at": v.get("started_at"),
                     "completed_at": v.get("completed_at"),
                     "artifact_id": v.get("artifact_id"),
+                    "replay_dataset_path": v.get("replay_dataset_path"),
                     "error": v.get("error"),
                     "log": v.get("log", []),
                 }
@@ -967,6 +1286,7 @@ def _slug(value: object) -> str:
 
 
 def _list_replay_datasets() -> list[dict]:
+    _COMPANION_SUFFIXES = {".intervals.csv", ".manifest.json"}
     paths = sorted(
         [
             *Path("examples").glob("**/*.csv"),
@@ -975,7 +1295,12 @@ def _list_replay_datasets() -> list[dict]:
             *Path("data").glob("**/*.jsonl"),
         ]
     )
-    return [_dataset_summary(path) for path in paths if path.is_file()]
+    return [
+        _dataset_summary(path)
+        for path in paths
+        if path.is_file()
+        and not any(str(path).endswith(suffix) for suffix in _COMPANION_SUFFIXES)
+    ]
 
 
 def _dataset_summary(path: Path) -> dict:
@@ -986,6 +1311,7 @@ def _dataset_summary(path: Path) -> dict:
     event_count, labeled_count = _dataset_counts(path)
     fingerprint = manifest.get("dataset_fingerprint") if manifest else ""
     provenance = replay_data_provenance(path)
+    intervals_path = fleet_intervals_path_for(path)
     return {
         "path": str(path),
         "name": path.stem,
@@ -1000,6 +1326,8 @@ def _dataset_summary(path: Path) -> dict:
         "data_provenance": provenance,
         "validation_signal": provenance.get("validation_signal"),
         "production_validation_ready": provenance.get("production_validation_ready", False),
+        "has_fleet_intervals": intervals_path.exists(),
+        "fleet_intervals_path": str(intervals_path) if intervals_path.exists() else "",
     }
 
 

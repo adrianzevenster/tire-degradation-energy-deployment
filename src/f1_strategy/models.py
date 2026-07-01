@@ -3,13 +3,26 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import exp, sqrt
 from pathlib import Path
 from statistics import mean
-from typing import Protocol
+from typing import Any, Protocol
 
 from f1_strategy.domain import OnlineFeatures, Prediction, TireCompound
+
+
+IMPORTANCE_SUFFIX = ".importance.json"
+
+
+def load_feature_importance(model_path: Path) -> dict[str, float]:
+    importance_path = model_path.with_name(model_path.name + IMPORTANCE_SUFFIX)
+    if not importance_path.exists():
+        return {}
+    try:
+        return json.loads(importance_path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
 
 
 COMPOUND_LIFE = {
@@ -81,9 +94,13 @@ FEATURE_NAMES = [
     "dirty_air_risk",
     "circuit_base_lap_s",
     *[f"compound_{compound.value}" for compound in TireCompound],
+    "stint_lap_delta_s",
+    "lap_to_lap_delta_s",
+    "stint_phase",
+    *[f"compound_age_{compound.value}" for compound in TireCompound],
 ]
 
-FEATURE_SCHEMA_VERSION = "online-features-v3"
+FEATURE_SCHEMA_VERSION = "online-features-v5"
 
 
 def feature_schema_hash(feature_names: list[str] | None = None) -> str:
@@ -193,14 +210,19 @@ class ServingModel(Protocol):
 
     def predict(self, features: OnlineFeatures) -> Prediction: ...
 
+    def feature_importance(self) -> dict[str, float]: ...
+
 
 def features_to_vector(features: OnlineFeatures) -> list[float]:
     compound_flags = [1.0 if features.compound == compound else 0.0 for compound in TireCompound]
+    tire_age_norm = features.tire_age_laps / 45.0
+    compound_life = COMPOUND_LIFE.get(features.compound, 28.0)
+    stint_phase = min(1.0, features.tire_age_laps / max(1.0, compound_life))
     return [
         1.0,
         CIRCUIT_ENCODING.get(features.circuit, 0.0),
         features.rolling_lap_time_s / 130.0,
-        features.tire_age_laps / 45.0,
+        tire_age_norm,
         features.mean_tire_temp / 125.0,
         features.tire_temp_gradient / 35.0,
         features.brake_heat_index / 850.0,
@@ -215,6 +237,10 @@ def features_to_vector(features: OnlineFeatures) -> list[float]:
         features.dirty_air_risk,
         features.circuit_base_lap_s / 130.0,
         *compound_flags,
+        features.stint_lap_delta_s / 8.0,
+        features.lap_to_lap_delta_s / 4.0,
+        stint_phase,
+        *[f * tire_age_norm for f in compound_flags],
     ]
 
 
@@ -240,6 +266,7 @@ class HybridOnlineEnsembleModel:
         ]
         self.observations = 0
         self.absolute_errors: deque[float] = deque(maxlen=250)
+        self._peak_wear: dict[tuple[str, str], float] = {}
 
     def observe(self, features: OnlineFeatures) -> None:
         target_delta = features.rolling_lap_time_s - self.config.base_lap_time_s
@@ -293,7 +320,7 @@ class HybridOnlineEnsembleModel:
             session_id=features.session_id,
             car_id=features.car_id,
             lap=features.lap,
-            tire_wear_pct=prior.tire_wear_pct,
+            tire_wear_pct=self._clamped_wear(features, prior.tire_wear_pct),
             remaining_tire_life_laps=prior.remaining_tire_life_laps,
             grip_loss_pct=grip_loss,
             overheating_probability=prior.overheating_probability,
@@ -320,7 +347,7 @@ class HybridOnlineEnsembleModel:
             session_id=features.session_id,
             car_id=features.car_id,
             lap=features.lap,
-            tire_wear_pct=prior.tire_wear_pct,
+            tire_wear_pct=self._clamped_wear(features, prior.tire_wear_pct),
             remaining_tire_life_laps=prior.remaining_tire_life_laps,
             grip_loss_pct=min(45.0, prior.grip_loss_pct + grip_adjustment),
             overheating_probability=prior.overheating_probability,
@@ -331,6 +358,15 @@ class HybridOnlineEnsembleModel:
             uncertainty_low_s=lap_delta - uncertainty,
             uncertainty_high_s=lap_delta + uncertainty,
         )
+
+    def _clamped_wear(self, features: OnlineFeatures, raw_wear: float) -> float:
+        key = (features.session_id, features.car_id)
+        if features.tire_age_laps <= 1:
+            self._peak_wear.pop(key, None)
+        peak = self._peak_wear.get(key, 0.0)
+        clamped = max(peak, raw_wear)
+        self._peak_wear[key] = clamped
+        return clamped
 
     def _physics_prior(self, features: OnlineFeatures) -> _PhysicsPrior:
         life = COMPOUND_LIFE[features.compound]
@@ -407,11 +443,16 @@ class HybridOnlineEnsembleModel:
             rolling_lap_time_s=90.0,
             dirty_air_risk=0.0,
             circuit_base_lap_s=90.0,
+            stint_lap_delta_s=0.0,
+            lap_to_lap_delta_s=0.0,
         )
 
     @staticmethod
     def _sigmoid(value: float) -> float:
         return 1.0 / (1.0 + exp(-value))
+
+    def feature_importance(self) -> dict[str, float]:
+        return {}
 
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
@@ -450,6 +491,7 @@ class XGBoostModel:
                 f"expected={feature_schema_hash()}"
             )
         self.booster.set_param({"device": "cpu", "nthread": 1})
+        self._peak_wear: dict[tuple[str, str], float] = {}
         warmup = self._np.asarray(
             [features_to_vector(HybridOnlineEnsembleModel._cold_start_features())]
         )
@@ -465,7 +507,7 @@ class XGBoostModel:
         raw_prediction = self.booster.inplace_predict(matrix)
         outputs = self._coerce_outputs(raw_prediction)
 
-        lap_delta = self._clamp(outputs[0], -25.0, 15.0)
+        xgb_delta = self._clamp(outputs[0], -25.0, 15.0)
         tire_wear_pct = fallback.tire_wear_pct
         cliff_probability = fallback.cliff_probability
         brake_temp_next_lap_c = fallback.brake_temp_next_lap_c
@@ -476,8 +518,30 @@ class XGBoostModel:
         if len(outputs) >= 4:
             brake_temp_next_lap_c = self._clamp(outputs[3], 300.0, 1200.0)
 
+        key = (features.session_id, features.car_id)
+        if features.tire_age_laps <= 1:
+            self._peak_wear.pop(key, None)
+        peak = self._peak_wear.get(key, 0.0)
+        tire_wear_pct = max(peak, tire_wear_pct)
+        self._peak_wear[key] = tire_wear_pct
+
+        # Anchor to observed pace after warm-up.  observed_delta is now always
+        # in the correct reference frame because engine_factory propagates
+        # spec.base_lap_time_s into self.config via settings.
+        # Adding a momentum term (2.5× lap-to-lap rate) compensates for the
+        # 5-lap rolling average lagging ~2 laps behind actual pace during
+        # rapid degradation / cliff transition.
+        lap_delta = xgb_delta
+        if self.fallback.observations > 0:
+            observed_delta = features.rolling_lap_time_s - self.config.base_lap_time_s
+            momentum = features.lap_to_lap_delta_s * 2.5
+            # Steeper ramp + higher cap (0.95) so xgb contributes only ~5% at
+            # steady state, limiting bias from compound-specific overestimates.
+            anchor_weight = min(0.95, 0.80 + self.fallback.observations / 60.0)
+            lap_delta = (observed_delta + momentum) * anchor_weight + xgb_delta * (1.0 - anchor_weight)
+
         fallback_width = fallback.uncertainty_high_s - fallback.uncertainty_low_s
-        model_delta_gap = abs(lap_delta - fallback.next_lap_delta_s)
+        model_delta_gap = abs(xgb_delta - fallback.next_lap_delta_s)
         uncertainty = max(0.14, min(2.65, fallback_width / 2.0 + model_delta_gap * 0.15))
         grip_adjustment = max(0.0, lap_delta - fallback.next_lap_delta_s) * 0.6
 
@@ -511,6 +575,16 @@ class XGBoostModel:
             return [float(raw_prediction[0])]
         return [float(raw_prediction)]
 
+    def feature_importance(self) -> dict[str, float]:
+        cached = load_feature_importance(self.model_path)
+        if cached:
+            return cached
+        try:
+            raw = self.booster.get_score(importance_type="gain")
+            return {k: float(v) for k, v in raw.items()}
+        except Exception:
+            return {}
+
     @staticmethod
     def _clamp(value: float, low: float, high: float) -> float:
         return min(high, max(low, value))
@@ -538,6 +612,7 @@ class LightGBMModel:
             raise RuntimeError(f"LightGBM model artifact does not exist: {self.model_path}")
         self._np = np
         self.booster = lgb.Booster(model_file=str(self.model_path))
+        self._peak_wear: dict[tuple[str, str], float] = {}
         validate_model_manifest(self.model_path, self.backend_name)
         self.booster.predict(
             self._np.asarray(
@@ -551,12 +626,39 @@ class LightGBMModel:
     def predict(self, features: OnlineFeatures) -> Prediction:
         vector = self._np.asarray([features_to_vector(features)], dtype="float32")
         raw_prediction = self.booster.predict(vector)
-        lap_delta = _clamp(_first_prediction(raw_prediction), -25.0, 15.0)
+        lgb_delta = _clamp(_first_prediction(raw_prediction), -25.0, 15.0)
+
+        lap_delta = lgb_delta
+        if self.fallback.observations > 0:
+            observed_delta = features.rolling_lap_time_s - self.config.base_lap_time_s
+            momentum = features.lap_to_lap_delta_s * 2.5
+            # LightGBM has larger raw-prediction bias than XGBoost on hot/wet extremes;
+            # cap at 0.99 so the model component contributes at most 1% of the delta.
+            anchor_weight = min(0.99, 0.85 + self.fallback.observations / 30.0)
+            lap_delta = (observed_delta + momentum) * anchor_weight + lgb_delta * (1.0 - anchor_weight)
+
         fallback = self.fallback.predict(features)
         width = (fallback.uncertainty_high_s - fallback.uncertainty_low_s) / 2.0
-        return self.fallback.prediction_from_lap_delta(
-            features, lap_delta, uncertainty_extra=width * 0.2
-        )
+        pred = self.fallback.prediction_from_lap_delta(features, lap_delta, uncertainty_extra=width * 0.2)
+
+        key = (features.session_id, features.car_id)
+        if features.tire_age_laps <= 1:
+            self._peak_wear.pop(key, None)
+        peak = self._peak_wear.get(key, 0.0)
+        clamped_wear = max(peak, pred.tire_wear_pct)
+        self._peak_wear[key] = clamped_wear
+        return replace(pred, tire_wear_pct=clamped_wear)
+
+    def feature_importance(self) -> dict[str, float]:
+        cached = load_feature_importance(self.model_path)
+        if cached:
+            return cached
+        try:
+            scores = self.booster.feature_importance(importance_type="gain")
+            names = self.booster.feature_name()
+            return {name: float(score) for name, score in zip(names, scores)}
+        except Exception:
+            return {}
 
 
 class CatBoostModel:
@@ -580,6 +682,7 @@ class CatBoostModel:
             raise RuntimeError(f"CatBoost model artifact does not exist: {self.model_path}")
         self.model = CatBoostRegressor()
         self.model.load_model(str(self.model_path))
+        self._peak_wear: dict[tuple[str, str], float] = {}
         validate_model_manifest(self.model_path, self.backend_name)
         self.model.predict([features_to_vector(HybridOnlineEnsembleModel._cold_start_features())])
 
@@ -588,12 +691,37 @@ class CatBoostModel:
 
     def predict(self, features: OnlineFeatures) -> Prediction:
         raw_prediction = self.model.predict([features_to_vector(features)])
-        lap_delta = _clamp(_first_prediction(raw_prediction), -25.0, 15.0)
+        cb_delta = _clamp(_first_prediction(raw_prediction), -25.0, 15.0)
+
+        lap_delta = cb_delta
+        if self.fallback.observations > 0:
+            observed_delta = features.rolling_lap_time_s - self.config.base_lap_time_s
+            momentum = features.lap_to_lap_delta_s * 2.5
+            anchor_weight = min(0.99, 0.85 + self.fallback.observations / 30.0)
+            lap_delta = (observed_delta + momentum) * anchor_weight + cb_delta * (1.0 - anchor_weight)
+
         fallback = self.fallback.predict(features)
         width = (fallback.uncertainty_high_s - fallback.uncertainty_low_s) / 2.0
-        return self.fallback.prediction_from_lap_delta(
-            features, lap_delta, uncertainty_extra=width * 0.2
-        )
+        pred = self.fallback.prediction_from_lap_delta(features, lap_delta, uncertainty_extra=width * 0.2)
+
+        key = (features.session_id, features.car_id)
+        if features.tire_age_laps <= 1:
+            self._peak_wear.pop(key, None)
+        peak = self._peak_wear.get(key, 0.0)
+        clamped_wear = max(peak, pred.tire_wear_pct)
+        self._peak_wear[key] = clamped_wear
+        return replace(pred, tire_wear_pct=clamped_wear)
+
+    def feature_importance(self) -> dict[str, float]:
+        cached = load_feature_importance(self.model_path)
+        if cached:
+            return cached
+        try:
+            scores = self.model.get_feature_importance()
+            names = self.model.feature_names_
+            return {name: float(score) for name, score in zip(names, scores)}
+        except Exception:
+            return {}
 
 
 class SequenceTorchModel:
@@ -640,6 +768,9 @@ class SequenceTorchModel:
         lap_delta = _clamp(_first_prediction(raw_prediction), -25.0, 15.0)
         return self.fallback.prediction_from_lap_delta(features, lap_delta, uncertainty_extra=0.18)
 
+    def feature_importance(self) -> dict[str, float]:
+        return {}
+
 
 class KalmanFilterModel:
     """Dependency-free Kalman filter backend for online pace smoothing."""
@@ -678,6 +809,9 @@ class KalmanFilterModel:
             uncertainty_extra=sqrt(max(variance, 0.0)),
         )
 
+    def feature_importance(self) -> dict[str, float]:
+        return {}
+
 
 class RiverOnlineModel:
     """River online regressor backend with hybrid fallback."""
@@ -715,9 +849,95 @@ class RiverOnlineModel:
         blended = (1.0 - warmup) * fallback.next_lap_delta_s + warmup * float(prediction)
         return self.fallback.prediction_from_lap_delta(features, _clamp(blended, -25.0, 15.0))
 
+    def feature_importance(self) -> dict[str, float]:
+        return {}
+
     @staticmethod
     def _features(features: OnlineFeatures) -> dict[str, float]:
         return dict(zip(FEATURE_NAMES, features_to_vector(features), strict=True))
+
+
+class _StintEntry:
+    def __init__(self, compound: str) -> None:
+        self.compound = compound
+        self._n: int = 0
+        self._bias: float = 0.0
+        self._river: Any = None
+        try:
+            from river import compose, linear_model, preprocessing
+            self._river = compose.Pipeline(
+                preprocessing.StandardScaler(),
+                linear_model.LinearRegression(),
+            )
+        except ImportError:
+            pass
+
+    def update(self, vector: list[float], residual: float) -> None:
+        self._n += 1
+        self._bias += (residual - self._bias) / self._n
+        if self._river is not None:
+            self._river.learn_one(dict(enumerate(vector)), residual)
+
+    def correction(self, vector: list[float]) -> float:
+        if self._n < 4:
+            return 0.0
+        scale = min(1.0, (self._n - 3) / 8.0)
+        if self._river is not None:
+            pred = self._river.predict_one(dict(enumerate(vector)))
+            if pred is not None:
+                return float(pred) * scale
+        return self._bias * scale
+
+
+class StintResidualAdapter:
+    """Wraps any ServingModel with per-car per-stint online residual correction.
+
+    Uses River LinearRegression when available, falls back to per-stint bias mean.
+    Resets the learner on compound change (pit stop).
+    """
+
+    def __init__(self, base: ServingModel, config: ModelConfig | None = None) -> None:
+        self.base = base
+        self.config = config or ModelConfig()
+        self.backend_name = f"{base.backend_name}+stint-residual"
+        self._entries: dict[tuple[str, str], _StintEntry] = {}
+
+    def observe(self, features: OnlineFeatures) -> None:
+        self.base.observe(features)
+        if features.rolling_lap_time_s <= 0:
+            return
+        key = (features.session_id, features.car_id)
+        compound = features.compound.value
+        entry = self._entries.get(key)
+        if entry is None or entry.compound != compound:
+            entry = _StintEntry(compound)
+            self._entries[key] = entry
+        base_pred = _clamp(self.base.predict(features).next_lap_delta_s, -25.0, 15.0)
+        target = features.rolling_lap_time_s - self.config.base_lap_time_s
+        residual = target - base_pred
+        if abs(residual) < 5.0:
+            entry.update(features_to_vector(features), residual)
+
+    def predict(self, features: OnlineFeatures) -> Prediction:
+        pred = self.base.predict(features)
+        key = (features.session_id, features.car_id)
+        entry = self._entries.get(key)
+        if entry is None or entry.compound != features.compound.value:
+            return pred
+        correction = entry.correction(features_to_vector(features))
+        if correction == 0.0:
+            return pred
+        corrected = _clamp(pred.next_lap_delta_s + correction, -25.0, 15.0)
+        half_width = (pred.uncertainty_high_s - pred.uncertainty_low_s) / 2.0
+        return replace(
+            pred,
+            next_lap_delta_s=corrected,
+            uncertainty_low_s=corrected - half_width,
+            uncertainty_high_s=corrected + half_width,
+        )
+
+    def feature_importance(self) -> dict[str, float]:
+        return self.base.feature_importance()
 
 
 def _first_prediction(raw_prediction: object) -> float:
@@ -776,6 +996,11 @@ def create_serving_model(
         return KalmanFilterModel(config)
     if normalized_backend in {"river", "river-online"}:
         return RiverOnlineModel(config)
+    if normalized_backend in {"xgboost+stint", "xgboost+stint-residual"}:
+        base = XGBoostModel(xgboost_model_path, config=config)
+        if model_artifact_id.strip():
+            setattr(base, "artifact_id", model_artifact_id.strip())
+        return StintResidualAdapter(base, config)
 
     artifact_backends = {
         "xgboost": lambda: XGBoostModel(xgboost_model_path, config=config),

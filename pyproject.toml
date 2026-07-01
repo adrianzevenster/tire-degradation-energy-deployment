@@ -24,7 +24,7 @@ observability = ["prometheus-client>=0.20"]
 persistence = ["duckdb>=1.0"]
 data = ["fastf1>=3.5", "pandas>=2.0"]
 tracking = ["mlflow>=2.12"]
-dev = ["pytest>=8.0", "ruff>=0.4"]
+dev = ["pytest>=8.0", "ruff>=0.4", "dvc>=3.0", "dvc-s3>=3.0"]
 
 [project.scripts]
 f1-simulate = "f1_strategy.cli:simulate_main"
@@ -36,6 +36,8 @@ f1-train-xgboost = "f1_strategy.training:main"
 f1-artifacts = "f1_strategy.artifacts:main"
 f1-export-fastf1-replay = "f1_strategy.data_sources.fastf1_export:main"
 f1-export-openf1 = "f1_strategy.data_sources.openf1_export:main"
+f1-export-openf1-fleet = "f1_strategy.data_sources.openf1_intervals:main"
+f1-export-data = "f1_strategy.persistence:main"
 
 [build-system]
 requires = ["setuptools>=68"]

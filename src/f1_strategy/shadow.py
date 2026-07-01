@@ -1,11 +1,41 @@
 from __future__ import annotations
 
 from collections import deque
+from math import exp, pi, sqrt
 from statistics import mean, stdev
 from time import perf_counter
 
 from f1_strategy.domain import OnlineFeatures, Prediction
 from f1_strategy.models import ServingModel
+
+
+def _normal_sf(z: float) -> float:
+    """P(Z > z) for Z ~ N(0,1) via Abramowitz & Stegun 26.2.17 (max error 7.5e-8)."""
+    t = 1.0 / (1.0 + 0.2316419 * abs(z))
+    poly = t * (
+        0.319381530
+        + t * (-0.356563782 + t * (1.781477937 + t * (-1.821255978 + t * 1.330274429)))
+    )
+    return exp(-0.5 * z * z) / sqrt(2.0 * pi) * poly
+
+
+def _welch_pvalue(a: list[float], b: list[float]) -> float:
+    """Two-sample Welch t-test p-value (two-tailed).  Returns p in [0, 1].
+
+    Uses a normal approximation which is accurate for n >= 30 per group.
+    """
+    na, nb = len(a), len(b)
+    if na < 2 or nb < 2:
+        return 1.0
+    mean_a = sum(a) / na
+    mean_b = sum(b) / nb
+    var_a = sum((x - mean_a) ** 2 for x in a) / (na - 1)
+    var_b = sum((x - mean_b) ** 2 for x in b) / (nb - 1)
+    se2 = var_a / na + var_b / nb
+    if se2 == 0.0:
+        return 0.0 if mean_a != mean_b else 1.0
+    t_stat = (mean_a - mean_b) / sqrt(se2)
+    return _normal_sf(abs(t_stat)) * 2.0  # two-tailed
 
 
 class ShadowDeploymentManager:
@@ -113,17 +143,18 @@ class ShadowDeploymentManager:
         self,
         min_predictions: int = _PROMOTE_MIN_PREDICTIONS,
         improvement_threshold_s: float = _PROMOTE_IMPROVEMENT_S,
+        significance_level: float = 0.05,
     ) -> dict | None:
-        """Return promotion metadata if the challenger consistently outperforms.
+        """Return promotion metadata if the challenger significantly outperforms the champion.
 
-        Returns None when:
-        - Shadow is inactive
-        - Fewer than min_predictions have been recorded
-        - Challenger is not better than champion by improvement_threshold_s
+        Gates applied in order:
+        1. Shadow must be active with >= min_predictions recorded.
+        2. Mean improvement must exceed improvement_threshold_s.
+        3. Welch t-test on |champion_delta| vs |challenger_delta| must be significant
+           at significance_level (p < significance_level).  Rejects spurious wins on
+           small or high-variance windows that would pass a raw mean comparison.
 
-        The comparison is on mean absolute lap-delta (a proxy for MAE since
-        both models see the same inputs but we have no ground-truth labels
-        during shadow serving).
+        Returns None when any gate fails.
         """
         if not self.active:
             return None
@@ -131,11 +162,17 @@ class ShadowDeploymentManager:
             return None
         window = list(self._window)
 
-        champion_mean = mean(abs(r["champion_delta_s"]) for r in window)
-        challenger_mean = mean(abs(r["challenger_delta_s"]) for r in window)
+        champion_abs = [abs(r["champion_delta_s"]) for r in window]
+        challenger_abs = [abs(r["challenger_delta_s"]) for r in window]
+        champion_mean = mean(champion_abs)
+        challenger_mean = mean(challenger_abs)
         improvement_s = champion_mean - challenger_mean
 
         if improvement_s < improvement_threshold_s:
+            return None
+
+        p_value = _welch_pvalue(champion_abs, challenger_abs)
+        if p_value >= significance_level:
             return None
 
         return {
@@ -146,5 +183,6 @@ class ShadowDeploymentManager:
             "improvement_s": round(improvement_s, 4),
             "improvement_pct": round(improvement_s / max(champion_mean, 1e-6) * 100, 1),
             "window_size": len(window),
+            "p_value": round(p_value, 4),
             "recommendation": "promote_challenger",
         }

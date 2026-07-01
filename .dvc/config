@@ -1,0 +1,9 @@
+[core]
+    remote = local
+    autostage = true
+['remote "local"']
+    url = /tmp/dvc-remote-f1
+# Production remote — configure via: dvc remote modify origin url s3://your-bucket/f1-tire-energy
+# then set AWS_ACCESS_KEY_ID / AWS_SECRET_ACCESS_KEY in GitHub repo secrets as DVC_REMOTE_URL
+['remote "origin"']
+    url = s3://your-bucket/f1-tire-energy

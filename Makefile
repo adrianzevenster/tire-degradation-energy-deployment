@@ -29,18 +29,20 @@ MULTI_SESSIONS ?= Bahrain Monaco Monza Silverstone Singapore
 MULTI_DRIVER ?= VER
 MULTI_YEAR ?= 2024
 
-.PHONY: help install install-api install-persistence install-data compile test regression evaluate replay-evaluate replay-benchmark replay-manifest-check export-fastf1-replay export-multi export-openf1 export-openf1-bulk reports train train-real train-evaluate train-evaluate-real train-multi train-evaluate-multi train-openf1 train-evaluate-openf1 register-local-artifacts prune-artifacts promote-artifact rollback-candidate
-.PHONY: ci docker-build clean-reports
+.PHONY: help install install-api install-persistence install-data install-ml compile test test-integration regression evaluate replay-evaluate replay-benchmark replay-manifest-check export-fastf1-replay export-multi export-openf1 export-openf1-bulk reports train train-real train-evaluate train-evaluate-real train-multi train-evaluate-multi train-openf1 train-evaluate-openf1 register-local-artifacts prune-artifacts promote-artifact rollback-candidate
+.PHONY: ci docker-build clean-reports deploy deploy-prod certs export-parquet
 
 help:
 	@printf '%s\n' \
 		'Targets:' \
 		'  install              Install the package in editable mode' \
 		'  install-api          Install API and observability extras' \
+		'  install-ml           Install ML + persistence + tracking extras' \
 		'  install-persistence  Install DuckDB persistence extra' \
 		'  install-data         Install FastF1 replay export dependencies' \
 		'  compile              Compile src and tests' \
 		'  test                 Run unittest suite' \
+		'  test-integration     Run live OpenF1 API integration tests' \
 		'  regression           Run deterministic regression gates' \
 		'  evaluate             Print Markdown evaluation report' \
 		'  replay-evaluate      Run replay holdout gates against REPLAY_DATASET' \
@@ -63,7 +65,11 @@ help:
 		'  promote-artifact     Promote ARTIFACT_ID after registry gate checks' \
 		'  rollback-candidate   Print latest promoted rollback candidate' \
 		'  ci                   Run compile, test, regression, and reports' \
-		'  docker-build         Build local API Docker image'
+		'  docker-build         Build local API Docker image' \
+		'  certs                Generate self-signed TLS certificate for nginx' \
+		'  deploy               Full deploy via scripts/deploy.sh (cert + build + up)' \
+		'  deploy-prod          Docker compose up with prod overlay (assumes certs exist)' \
+		'  export-parquet       Export DuckDB tables to Parquet in data/exports/'
 
 install:
 	$(PYTHON) -m pip install -e .
@@ -251,3 +257,28 @@ docker-build:
 
 clean-reports:
 	rm -f $(REPORT_DIR)/model-evaluation.json $(REPORT_DIR)/model-evaluation.md
+
+install-ml:
+	$(PYTHON) -m pip install -e ".[ml,catboost,persistence,tracking]"
+
+test-integration:
+	$(PYTHON) -m pytest tests/test_integration_openf1.py -m integration -v
+
+certs:
+	mkdir -p monitoring/nginx/certs
+	openssl req -x509 -nodes -days 365 -newkey rsa:2048 \
+		-keyout monitoring/nginx/certs/server.key \
+		-out    monitoring/nginx/certs/server.crt \
+		-subj   "/CN=167.233.125.215" \
+		-addext "subjectAltName=IP:167.233.125.215" 2>/dev/null
+	chmod 600 monitoring/nginx/certs/server.key
+	@echo "Self-signed certificate written to monitoring/nginx/certs/"
+
+deploy:
+	bash scripts/deploy.sh
+
+deploy-prod:
+	docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans
+
+export-parquet:
+	f1-export-data --db data/f1_strategy.duckdb --output data/exports

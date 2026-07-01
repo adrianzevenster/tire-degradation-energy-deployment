@@ -56,7 +56,9 @@
 
       <nav class="tabs" aria-label="Dashboard views">
         <button id="liveTabButton" class="tab-button active" type="button">Live</button>
-        <button id="opsTabButton" class="tab-button" type="button">Operations</button>
+        <button id="evaluationTabButton" class="tab-button" type="button">Evaluation</button>
+        <button id="promotionTabButton" class="tab-button" type="button">Promotion</button>
+        <button id="trainingTabButton" class="tab-button" type="button">Training</button>
         <button id="historyTabButton" class="tab-button" type="button">Run History</button>
       </nav>
 
@@ -170,6 +172,18 @@
                 <span>Pace Target</span>
                 <strong id="paceTarget">-</strong>
               </div>
+              <div>
+                <span>Cliff Lap</span>
+                <strong id="cliffLapEstimate">-</strong>
+              </div>
+              <div>
+                <span>Undercut Window</span>
+                <strong id="undercutWindowValue">-</strong>
+              </div>
+              <div>
+                <span>Overcut Window</span>
+                <strong id="overcutWindowValue">-</strong>
+              </div>
             </div>
             <div class="deployment" id="deploymentBars"></div>
             <ul id="reasonList" class="reason-list"></ul>
@@ -228,7 +242,7 @@
         </section>
       </section>
 
-      <section id="opsTab" class="tab-view">
+      <section id="evaluationTab" class="tab-view">
         <section class="panel live-data-panel">
           <div class="panel-head">
             <h2>Live Data</h2>
@@ -462,7 +476,8 @@
                   Driver
                   <input id="openf1DriverInput" type="text" value="VER" />
                 </label>
-                <button id="openf1ExportButton" type="button" title="Export OpenF1 data (accurate tire age)">Export</button>
+                <button id="openf1ExportButton" type="button" title="Export single-driver replay CSV (accurate tire age)">Export</button>
+                <button id="openf1FleetExportButton" type="button" title="Export fleet gap and position data for all drivers (companion .intervals.csv)">Export Fleet</button>
                 <span class="openf1-badge" title="Tire age from stints — no FastF1 dependency">✓ tyre_age</span>
               </div>
               <div class="dataset-controls">
@@ -484,10 +499,11 @@
                       <th>Label Type</th>
                       <th>Prod Ready</th>
                       <th>Manifest</th>
+                      <th>Fleet</th>
                     </tr>
                   </thead>
                   <tbody id="replayDatasetRows">
-                    <tr><td colspan="8">No replay datasets</td></tr>
+                    <tr><td colspan="9">No replay datasets</td></tr>
                   </tbody>
                 </table>
               </div>
@@ -560,6 +576,14 @@
               <div id="regressionChecks" class="check-list compact"></div>
             </div>
           </div>
+          <div class="smoke-strip">
+            <button id="smokeRunButton" type="button" title="Run the full deployment smoke path">Run Deployment Smoke</button>
+            <span id="smokeRunState">Ready</span>
+          </div>
+          <div class="replay-grid smoke-grid">
+            <div class="detail-grid" id="smokeSummary"></div>
+            <div class="check-list compact" id="smokeChecks"></div>
+          </div>
         </section>
 
         <section class="panel">
@@ -610,10 +634,89 @@
                   <th>Regret</th>
                 </tr>
               </thead>
-              <tbody id="replaySuiteRows">
+            <tbody id="replaySuiteRows">
                 <tr><td colspan="9">No replay suite</td></tr>
               </tbody>
             </table>
+          </div>
+        </section>
+      </section>
+
+      <section id="promotionTab" class="tab-view">
+        <section class="panel external-links-panel">
+          <div class="panel-head">
+            <h2>External Links</h2>
+            <span id="externalLinksState">Services</span>
+          </div>
+          <div class="external-links-row" id="externalLinksRow">
+            <span class="ext-link disabled">Checking services...</span>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Model Comparison</h2>
+            <span id="comparisonState">No evaluated models</span>
+          </div>
+          <div id="comparisonSummary" class="performance-strip">
+            <div class="performance-chip">
+              <span>Current Model</span>
+              <strong id="comparisonModelValue">-</strong>
+            </div>
+            <div class="performance-chip">
+              <span>Rank</span>
+              <strong id="comparisonRankValue">-</strong>
+            </div>
+            <div class="performance-chip">
+              <span>Gap to Best</span>
+              <strong id="comparisonGapValue">-</strong>
+            </div>
+            <div class="performance-chip">
+              <span>Verdict</span>
+              <strong id="comparisonVerdictValue">-</strong>
+            </div>
+            <div class="performance-chip">
+              <span>Action</span>
+              <strong id="comparisonActionValue">-</strong>
+            </div>
+          </div>
+          <div class="comparison-grid">
+            <div>
+              <canvas id="comparisonChart" width="900" height="280"></canvas>
+            </div>
+            <div class="history-table-wrap">
+              <table>
+                <thead>
+                  <tr>
+                    <th>Rank</th>
+                    <th>Model</th>
+                    <th>Artifact</th>
+                    <th>Eval</th>
+                    <th>MAE</th>
+                    <th>RMSE</th>
+                    <th>Coverage</th>
+                    <th>Action</th>
+                    <th>Health</th>
+                    <th>Alerts</th>
+                  </tr>
+                </thead>
+                <tbody id="comparisonRows">
+                  <tr><td colspan="10">No evaluated models</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-head">
+            <h2>Model Feature Importance</h2>
+            <span id="featureImportanceState">Loading</span>
+          </div>
+          <div id="featureImportancePanel" class="feature-importance-panel">
+            <div id="featureImportanceBars" class="feature-importance-bars">
+              <span class="muted">Feature importance not yet available. Train a model with --mlflow or reload after training.</span>
+            </div>
           </div>
         </section>
 
@@ -645,6 +748,11 @@
             <div>
               <div id="artifactDetailGrid" class="detail-grid artifact-detail-grid"></div>
               <div id="artifactBlockers" class="check-list compact artifact-blockers"></div>
+              <div class="artifact-actions">
+                <button id="promoteArtifactBtn" type="button" title="Promote selected artifact (must pass all gates)">Promote</button>
+                <button id="forcePromoteArtifactBtn" type="button" title="Force-promote selected artifact, bypassing MAE and replay gates">Force Promote</button>
+                <button id="deployArtifactBtn" type="button" title="Load the selected artifact into the serving engine now">Deploy</button>
+              </div>
               <div class="history-table-wrap artifact-suite-wrap">
                 <table>
                   <thead>
@@ -744,7 +852,9 @@
             </div>
           </div>
         </section>
+      </section>
 
+      <section id="trainingTab" class="tab-view">
         <section class="panel">
           <div class="panel-head">
             <h2>Model Training</h2>
@@ -782,6 +892,11 @@
                 <select id="trainingRealDataSelect" multiple size="4" title="Ctrl/Cmd+click to select multiple circuits">
                 </select>
               </label>
+              <label>
+                Replay Dataset
+                <select id="trainingReplayDatasetSelect" title="Replay dataset used when bundling the artifact">
+                </select>
+              </label>
               <label class="training-checkbox-label">
                 <input id="trainingMlflowInput" type="checkbox" />
                 Log to MLflow
@@ -794,48 +909,6 @@
             </div>
             <div class="training-jobs-col">
               <div id="trainingJobList" class="training-job-list"></div>
-            </div>
-          </div>
-        </section>
-
-        <section class="panel external-links-panel">
-          <div class="panel-head">
-            <h2>External Links</h2>
-            <span id="externalLinksState">Services</span>
-          </div>
-          <div class="external-links-row" id="externalLinksRow">
-            <span class="ext-link disabled">Checking services...</span>
-          </div>
-        </section>
-
-        <section class="panel">
-          <div class="panel-head">
-            <h2>Model Comparison</h2>
-            <span id="comparisonState">No evaluated models</span>
-          </div>
-          <div class="comparison-grid">
-            <div>
-              <canvas id="comparisonChart" width="900" height="280"></canvas>
-            </div>
-            <div class="history-table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Rank</th>
-                    <th>Model</th>
-                    <th>Artifact</th>
-                    <th>Eval</th>
-                    <th>MAE</th>
-                    <th>RMSE</th>
-                    <th>Coverage</th>
-                    <th>Health</th>
-                    <th>Alerts</th>
-                  </tr>
-                </thead>
-                <tbody id="comparisonRows">
-                  <tr><td colspan="9">No evaluated models</td></tr>
-                </tbody>
-              </table>
             </div>
           </div>
         </section>

@@ -1,0 +1,80 @@
+stages:
+  train:
+    foreach:
+      xgboost:
+        output: models/xgboost_lap_delta.json
+      lightgbm:
+        output: models/lightgbm_lap_delta.txt
+      catboost:
+        output: models/catboost_lap_delta.cbm
+    do:
+      cmd: >-
+        python -m f1_strategy.training
+        --backend ${key}
+        --seeds ${train.seeds}
+        --rounds ${train.rounds}
+        --artifact-root ${train.artifact_root}
+        --replay-dataset ${train.replay_dataset}
+        --real-data
+        data/fastf1-2023-bahrain-r-VER.csv
+        data/fastf1-2023-monaco-r-VER.csv
+        data/fastf1-2023-monza-r-VER.csv
+        data/fastf1-2023-silverstone-r-VER.csv
+        data/fastf1-2023-singapore-r-VER.csv
+        data/fastf1-2024-bahrain-r-HAM.csv
+        data/fastf1-2024-bahrain-r-LEC.csv
+        data/fastf1-2024-bahrain-r-NOR.csv
+        data/fastf1-2024-bahrain-r-ver.csv
+        data/fastf1-2024-monaco-r-HAM.csv
+        data/fastf1-2024-monaco-r-LEC.csv
+        data/fastf1-2024-monaco-r-NOR.csv
+        data/fastf1-2024-monaco-r-ver.csv
+        data/fastf1-2024-monza-r-HAM.csv
+        data/fastf1-2024-monza-r-LEC.csv
+        data/fastf1-2024-monza-r-NOR.csv
+        data/fastf1-2024-monza-r-ver.csv
+        data/fastf1-2024-multi-r-ver.csv
+        data/fastf1-2024-silverstone-r-HAM.csv
+        data/fastf1-2024-silverstone-r-LEC.csv
+        data/fastf1-2024-silverstone-r-NOR.csv
+        data/fastf1-2024-silverstone-r-ver.csv
+        data/fastf1-2024-singapore-r-HAM.csv
+        data/fastf1-2024-singapore-r-LEC.csv
+        data/fastf1-2024-singapore-r-NOR.csv
+        data/fastf1-2024-singapore-r-ver.csv
+        --output ${item.output}
+      deps:
+        - data/
+        - src/f1_strategy/
+        - examples/replay_telemetry.csv
+        - examples/replay_benchmarks/
+      params:
+        - train.seeds
+        - train.rounds
+        - train.artifact_root
+        - train.replay_dataset
+      outs:
+        - ${item.output}:
+            cache: true
+
+  promote:
+    foreach:
+      xgboost:
+        output: models/xgboost_lap_delta.json
+      lightgbm:
+        output: models/lightgbm_lap_delta.txt
+      catboost:
+        output: models/catboost_lap_delta.cbm
+    do:
+      cmd: >-
+        python -m f1_strategy.artifacts promote-latest
+        --backend ${key}
+        --artifact-root ${train.artifact_root}
+      deps:
+        - ${item.output}
+      params:
+        - train.artifact_root
+      metrics:
+        - artifacts/models/registry.json:
+            cache: false
+            persist: true

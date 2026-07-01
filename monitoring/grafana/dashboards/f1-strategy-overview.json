@@ -1,60 +1,322 @@
 {
+  "uid": "f1-strategy-v2",
   "title": "F1 Strategy Overview",
+  "description": "Real-time tire degradation, pace, ERS, and model health monitoring",
   "schemaVersion": 39,
-  "version": 1,
+  "version": 2,
   "refresh": "5s",
+  "time": {"from": "now-30m", "to": "now"},
+  "timepicker": {},
+  "tags": ["f1", "ml", "strategy"],
   "panels": [
     {
+      "id": 1,
+      "type": "stat",
+      "title": "API Status",
+      "gridPos": {"x": 0, "y": 0, "w": 4, "h": 4},
+      "targets": [{"expr": "up{job=\"f1-strategy-api\"}", "refId": "A", "legendFormat": "up"}],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "background",
+        "graphMode": "none",
+        "textMode": "auto",
+        "orientation": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "mappings": [
+            {"type": "value", "options": {"0": {"text": "DOWN", "color": "red"}, "1": {"text": "UP", "color": "green"}}}
+          ],
+          "thresholds": {"mode": "absolute", "steps": [{"color": "red", "value": null}, {"color": "green", "value": 1}]},
+          "color": {"mode": "thresholds"}
+        }
+      }
+    },
+    {
+      "id": 2,
       "type": "stat",
       "title": "Inference p95 ms",
-      "gridPos": {"x": 0, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "f1_inference_latency_ms_p95"}]
+      "gridPos": {"x": 4, "y": 0, "w": 4, "h": 4},
+      "targets": [{"expr": "f1_inference_latency_ms_p95", "refId": "A"}],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value",
+        "graphMode": "area",
+        "textMode": "auto"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 25}, {"color": "red", "value": 50}]},
+          "color": {"mode": "thresholds"}
+        }
+      }
     },
     {
+      "id": 3,
       "type": "stat",
-      "title": "Events Total",
-      "gridPos": {"x": 6, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "f1_throughput_events_total"}]
+      "title": "Predictions / s",
+      "gridPos": {"x": 8, "y": 0, "w": 4, "h": 4},
+      "targets": [{"expr": "f1_throughput_events_per_second", "refId": "A"}],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "color": {"mode": "thresholds"}
+        }
+      }
     },
     {
+      "id": 4,
+      "type": "stat",
+      "title": "Model MAE",
+      "gridPos": {"x": 12, "y": 0, "w": 4, "h": 4},
+      "targets": [{"expr": "f1_mae", "refId": "A"}],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 4,
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 0.3}, {"color": "red", "value": 0.5}]},
+          "color": {"mode": "thresholds"}
+        }
+      }
+    },
+    {
+      "id": 5,
       "type": "stat",
       "title": "Drift Alerts",
-      "gridPos": {"x": 12, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "f1_drift_alerts_total"}]
+      "gridPos": {"x": 16, "y": 0, "w": 4, "h": 4},
+      "targets": [{"expr": "f1_drift_alerts_total", "refId": "A"}],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 5}, {"color": "red", "value": 20}]},
+          "color": {"mode": "thresholds"}
+        }
+      }
     },
     {
+      "id": 6,
       "type": "stat",
-      "title": "Pit Recommendations",
-      "gridPos": {"x": 18, "y": 0, "w": 6, "h": 4},
-      "targets": [{"expr": "f1_pit_stop_recommendations_total"}]
+      "title": "Total Predictions",
+      "gridPos": {"x": 20, "y": 0, "w": 4, "h": 4},
+      "targets": [{"expr": "f1_predictions_total", "refId": "A"}],
+      "options": {
+        "reduceOptions": {"calcs": ["lastNotNull"]},
+        "colorMode": "value",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {"mode": "absolute", "steps": [{"color": "blue", "value": null}]},
+          "color": {"mode": "thresholds"}
+        }
+      }
     },
+
     {
+      "id": 10,
       "type": "timeseries",
       "title": "Tire Risk",
+      "description": "Wear %, cliff probability, and overheating probability over time",
       "gridPos": {"x": 0, "y": 4, "w": 12, "h": 8},
       "targets": [
-        {"expr": "f1_tire_wear_pct", "legendFormat": "wear pct"},
-        {"expr": "f1_tire_cliff_probability * 100", "legendFormat": "cliff probability pct"},
-        {"expr": "f1_overheating_probability * 100", "legendFormat": "overheat probability pct"}
-      ]
+        {"expr": "f1_tire_wear_pct", "refId": "A", "legendFormat": "Wear %"},
+        {"expr": "f1_tire_cliff_probability * 100", "refId": "B", "legendFormat": "Cliff probability %"},
+        {"expr": "f1_overheating_probability * 100", "refId": "C", "legendFormat": "Overheat probability %"}
+      ],
+      "options": {
+        "tooltip": {"mode": "multi"},
+        "legend": {"placement": "bottom", "displayMode": "table"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 100,
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10}
+        }
+      }
     },
     {
+      "id": 11,
       "type": "timeseries",
-      "title": "Pace and ERS",
+      "title": "Pace Delta & Uncertainty",
+      "description": "Next-lap delta relative to base lap time, with prediction interval",
       "gridPos": {"x": 12, "y": 4, "w": 12, "h": 8},
       "targets": [
-        {"expr": "f1_next_lap_delta_s", "legendFormat": "next lap delta"},
-        {"expr": "f1_ers_efficiency", "legendFormat": "ERS efficiency"},
-        {"expr": "f1_ers_ending_soc", "legendFormat": "ending SOC"}
-      ]
+        {"expr": "f1_next_lap_delta_s", "refId": "A", "legendFormat": "Next lap delta"},
+        {"expr": "f1_mae", "refId": "B", "legendFormat": "MAE"},
+        {"expr": "f1_prediction_interval_width_s", "refId": "C", "legendFormat": "Interval width"}
+      ],
+      "options": {
+        "tooltip": {"mode": "multi"},
+        "legend": {"placement": "bottom", "displayMode": "table"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3,
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10}
+        }
+      }
+    },
+
+    {
+      "id": 20,
+      "type": "timeseries",
+      "title": "ERS & Strategy",
+      "gridPos": {"x": 0, "y": 12, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "f1_ers_efficiency", "refId": "A", "legendFormat": "ERS efficiency"},
+        {"expr": "f1_ers_ending_soc", "refId": "B", "legendFormat": "Ending SOC"},
+        {"expr": "f1_undercut_success_probability", "refId": "C", "legendFormat": "Undercut probability"},
+        {"expr": "f1_safety_car_sensitivity", "refId": "D", "legendFormat": "Safety car sensitivity"}
+      ],
+      "options": {
+        "tooltip": {"mode": "multi"},
+        "legend": {"placement": "bottom", "displayMode": "table"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "min": 0,
+          "max": 1,
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10}
+        }
+      }
     },
     {
+      "id": 21,
       "type": "timeseries",
-      "title": "Drift Z Scores",
-      "gridPos": {"x": 0, "y": 12, "w": 24, "h": 8},
+      "title": "Feature Drift Z-Scores",
+      "description": "Z-score per feature — values > 3 trigger drift alerts",
+      "gridPos": {"x": 12, "y": 12, "w": 12, "h": 8},
       "targets": [
-        {"expr": "{__name__=~\"f1_drift_z_score_.*\"}"}
-      ]
+        {"expr": "{__name__=~\"f1_drift_z_score_.*\"}", "refId": "A", "legendFormat": "{{__name__}}"}
+      ],
+      "options": {
+        "tooltip": {"mode": "multi"},
+        "legend": {"placement": "bottom", "displayMode": "table"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 1, "fillOpacity": 0},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 2}, {"color": "red", "value": 3}]
+          }
+        }
+      }
+    },
+
+    {
+      "id": 30,
+      "type": "timeseries",
+      "title": "Model MAE by Backend",
+      "description": "Per-model rolling MAE — switch serving model when a challenger consistently beats the active backend",
+      "gridPos": {"x": 0, "y": 20, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "f1_model_mae_lap_delta_s", "refId": "A", "legendFormat": "{{backend}} {{artifact_id}}"}
+      ],
+      "options": {
+        "tooltip": {"mode": "multi"},
+        "legend": {"placement": "bottom", "displayMode": "table"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 4,
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10}
+        }
+      }
+    },
+    {
+      "id": 31,
+      "type": "timeseries",
+      "title": "Inference Latency",
+      "gridPos": {"x": 12, "y": 20, "w": 12, "h": 8},
+      "targets": [
+        {"expr": "f1_inference_latency_ms_p50", "refId": "A", "legendFormat": "p50"},
+        {"expr": "f1_inference_latency_ms_p95", "refId": "B", "legendFormat": "p95"},
+        {"expr": "f1_inference_latency_ms_p99 or f1_inference_latency_ms_p95", "refId": "C", "legendFormat": "p99"}
+      ],
+      "options": {
+        "tooltip": {"mode": "multi"},
+        "legend": {"placement": "bottom", "displayMode": "table"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ms",
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10},
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [{"color": "green", "value": null}, {"color": "yellow", "value": 25}, {"color": "red", "value": 50}]
+          }
+        }
+      }
+    },
+
+    {
+      "id": 40,
+      "type": "timeseries",
+      "title": "Throughput & Queue",
+      "gridPos": {"x": 0, "y": 28, "w": 12, "h": 6},
+      "targets": [
+        {"expr": "f1_throughput_events_per_second", "refId": "A", "legendFormat": "Events/s"},
+        {"expr": "f1_queue_depth", "refId": "B", "legendFormat": "Queue depth"}
+      ],
+      "options": {
+        "tooltip": {"mode": "multi"},
+        "legend": {"placement": "bottom", "displayMode": "table"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10}
+        }
+      }
+    },
+    {
+      "id": 41,
+      "type": "timeseries",
+      "title": "Pit Recommendations",
+      "gridPos": {"x": 12, "y": 28, "w": 12, "h": 6},
+      "targets": [
+        {"expr": "f1_pit_stop_recommendations_total", "refId": "A", "legendFormat": "Pit recommendations"},
+        {"expr": "f1_pace_target_delta_s", "refId": "B", "legendFormat": "Pace target delta"}
+      ],
+      "options": {
+        "tooltip": {"mode": "multi"},
+        "legend": {"placement": "bottom", "displayMode": "table"}
+      },
+      "fieldConfig": {
+        "defaults": {
+          "color": {"mode": "palette-classic"},
+          "custom": {"lineWidth": 2, "fillOpacity": 10}
+        }
+      }
     }
   ]
 }

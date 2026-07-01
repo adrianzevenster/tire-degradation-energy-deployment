@@ -12,11 +12,16 @@ services:
   mlflow:
     image: python:3.11-slim
     working_dir: /mlruns
-    command: >
-      bash -c "pip install -q 'mlflow>=2.12' &&
-               mlflow server --host 0.0.0.0 --port 5000
-               --backend-store-uri sqlite:////mlruns/mlflow.db
-               --default-artifact-root /mlruns/artifacts"
+    command:
+      - bash
+      - -lc
+      - >
+        pip install -q 'mlflow>=2.12' &&
+        exec mlflow server
+        --host 0.0.0.0
+        --port 5000
+        --backend-store-uri sqlite:////mlruns/mlflow.db
+        --default-artifact-root /mlruns/artifacts
     volumes:
       - ./data/mlruns:/mlruns
     ports:
@@ -47,10 +52,23 @@ services:
       - "--config.file=/etc/prometheus/prometheus.yml"
     volumes:
       - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
     ports:
       - "9090:9090"
     depends_on:
       - api
+
+  alertmanager:
+    image: prom/alertmanager:v0.27.0
+    command:
+      - "--config.file=/etc/alertmanager/alertmanager.yml"
+      - "--storage.path=/alertmanager"
+    volumes:
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports:
+      - "9093:9093"
+    depends_on:
+      - prometheus
 
   grafana:
     image: grafana/grafana:11.0.0

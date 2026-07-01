@@ -381,6 +381,20 @@ class DuckDBPersistence:
         self._ensure_column("evaluations", "app_version", "TEXT")
         self._ensure_column("evaluations", "build_sha", "TEXT")
 
+    def export_parquet(self, output_dir: Path | str) -> dict[str, Path]:
+        """Export all tables to Parquet files in output_dir. Returns {table: path}."""
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        tables = ["telemetry_events", "online_features", "predictions", "strategies", "evaluations"]
+        exported: dict[str, Path] = {}
+        for table in tables:
+            out = output_dir / f"{table}.parquet"
+            self.connection.execute(
+                f"COPY (SELECT * FROM {table}) TO '{out}' (FORMAT PARQUET)"
+            )
+            exported[table] = out
+        return exported
+
     def _ensure_column(self, table: str, column: str, data_type: str) -> None:
         self.connection.execute(
             f"ALTER TABLE {table} ADD COLUMN IF NOT EXISTS {column} {data_type}"
@@ -502,3 +516,16 @@ def _build_run_summaries(
             summary["max_lap_delta_s"] = 0.0
         summary["latest_prediction"].pop("_recorded_at_ms", None)
     return ordered[: max(1, limit)]
+
+
+
+def main() -> None:
+    import argparse
+    parser = argparse.ArgumentParser(description="Export DuckDB tables to Parquet files.")
+    parser.add_argument("--db", default="data/f1_strategy.duckdb", help="Path to DuckDB database")
+    parser.add_argument("--output", default="data/exports", help="Output directory for Parquet files")
+    args = parser.parse_args()
+    store = DuckDBPersistence(args.db)
+    exported = store.export_parquet(args.output)
+    for table, path in exported.items():
+        print(f"  {table}: {path}")

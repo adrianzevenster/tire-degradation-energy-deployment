@@ -43,6 +43,7 @@ REPLAY_REQUIRED_COLUMNS = [
 ]
 
 REPLAY_OPTIONAL_COLUMNS = ["lap_time_s", "timestamp_ms", "circuit"]
+REPLAY_IGNORED_COLUMNS = ["actual_tire_age_laps"]
 DEFAULT_REPLAY_DATASET = Path("examples/replay_telemetry.csv")
 
 
@@ -251,6 +252,7 @@ def replay_events(
     dataset_name: str,
     base_lap_time_s: float = 90.0,
     engine: InferenceEngine | None = None,
+    fleet_intervals: list[dict] | None = None,
 ) -> ScenarioEvaluation:
     if engine is not None:
         active_engine = engine
@@ -265,6 +267,7 @@ def replay_events(
             )
         )
     event_list = list(events)
+    _last_lap: dict[tuple[str, str], int] = {}
     errors: list[float] = []
     squared_errors: list[float] = []
     interval_widths: list[float] = []
@@ -280,6 +283,17 @@ def replay_events(
 
     for event in event_list:
         event_count += 1
+        lap_key = (event.session_id, event.car_id)
+        if fleet_intervals is not None and _last_lap.get(lap_key) != event.lap:
+            _last_lap[lap_key] = event.lap
+            from f1_strategy.data_sources.openf1_intervals import build_fleet_state_for_lap
+            fs = build_fleet_state_for_lap(
+                fleet_intervals,
+                event.session_id,
+                event.lap,
+                driver_number=event.car_id,
+            )
+            active_engine.update_fleet_state(fs)
         prediction = active_engine.ingest(event)
         stint_key = (event.session_id, event.car_id)
         lap_wear = lap_wear_by_stint.setdefault(stint_key, {})
@@ -344,6 +358,7 @@ def run_replay_evaluation(
     gates: ReplayGateConfig | None = None,
     base_lap_time_s: float | None = None,
     engine: InferenceEngine | None = None,
+    fleet_intervals_path: str | Path | None = None,
 ) -> ReplayEvaluationReport:
     path = Path(dataset_path)
     events = load_replay_events(path)
@@ -354,6 +369,14 @@ def run_replay_evaluation(
         if base_lap_time_s is not None
         else replay_reference_lap_time_s(path, default=90.0)
     )
+    fleet_intervals: list[dict] | None = None
+    from f1_strategy.data_sources.openf1_intervals import (
+        fleet_intervals_path_for,
+        load_fleet_intervals,
+    )
+    intervals_path = Path(fleet_intervals_path) if fleet_intervals_path else fleet_intervals_path_for(path)
+    if intervals_path.exists():
+        fleet_intervals = load_fleet_intervals(intervals_path)
     return evaluate_replay_event_list(
         events,
         dataset_name=path.stem,
@@ -362,6 +385,7 @@ def run_replay_evaluation(
         gates=gates,
         base_lap_time_s=reference_lap_time_s,
         engine=engine,
+        fleet_intervals=fleet_intervals,
     )
 
 
@@ -374,6 +398,7 @@ def evaluate_replay_event_list(
     gates: ReplayGateConfig | None = None,
     base_lap_time_s: float = 90.0,
     engine: InferenceEngine | None = None,
+    fleet_intervals: list[dict] | None = None,
 ) -> ReplayEvaluationReport:
     gate_config = gates or ReplayGateConfig()
     provenance = replay_data_provenance(dataset_path)
@@ -384,6 +409,7 @@ def evaluate_replay_event_list(
         dataset_name=dataset_name,
         base_lap_time_s=base_lap_time_s,
         engine=engine,
+        fleet_intervals=fleet_intervals,
     )
     gate_results = {
         "mae_lap_delta": scenario.mae_lap_delta_s <= gate_config.max_mae_lap_delta_s,
@@ -422,15 +448,17 @@ def run_replay_suite(
     specs: list[ReplaySplitSpec] | None = None,
     *,
     gates: ReplayGateConfig | None = None,
-    engine_factory: Callable[[], InferenceEngine] | None = None,
+    engine_factory: Callable[[float], InferenceEngine] | None = None,
     suite_name: str = "default",
 ) -> ReplaySuiteReport:
     selected = specs or DEFAULT_REPLAY_SUITE
     reports = []
     for spec in selected:
         events, fingerprint, dataset_path = _events_for_split(spec)
-        split_engine = engine_factory() if engine_factory is not None else _default_replay_engine(
-            spec.base_lap_time_s
+        split_engine = (
+            engine_factory(spec.base_lap_time_s)
+            if engine_factory is not None
+            else _default_replay_engine(spec.base_lap_time_s)
         )
         reports.append(
             evaluate_replay_event_list(
@@ -466,7 +494,7 @@ def run_replay_suite(
 
 def run_benchmark_replay_suite(
     *,
-    engine_factory: Callable[[], InferenceEngine] | None = None,
+    engine_factory: Callable[[float], InferenceEngine] | None = None,
 ) -> ReplaySuiteReport:
     return run_replay_suite(
         BENCHMARK_REPLAY_SUITE,
@@ -772,10 +800,12 @@ def dataset_fingerprint(path: str | Path) -> str:
 
 
 def validate_replay_payload(payload: dict) -> dict:
-    missing = [name for name in REPLAY_REQUIRED_COLUMNS if name not in payload]
+    normalized = dict(payload)
+    for ignored in REPLAY_IGNORED_COLUMNS:
+        normalized.pop(ignored, None)
+    missing = [name for name in REPLAY_REQUIRED_COLUMNS if name not in normalized]
     if missing:
         raise ValueError(f"Replay row is missing required columns: {', '.join(missing)}")
-    normalized = dict(payload)
     for key, value in list(normalized.items()):
         if value == "":
             normalized[key] = None
@@ -815,7 +845,9 @@ def _load_csv(path: Path) -> list[TelemetryEvent]:
         unknown = [
             name
             for name in reader.fieldnames
-            if name not in REPLAY_REQUIRED_COLUMNS and name not in REPLAY_OPTIONAL_COLUMNS
+            if name not in REPLAY_REQUIRED_COLUMNS
+            and name not in REPLAY_OPTIONAL_COLUMNS
+            and name not in REPLAY_IGNORED_COLUMNS
         ]
         if unknown:
             raise ValueError(f"Replay CSV has unsupported columns: {', '.join(unknown)}")

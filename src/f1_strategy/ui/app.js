@@ -12,8 +12,11 @@ const state = {
   replayBenchmark: null,
   replayRun: null,
   regressionRun: null,
+  smokeRun: null,
+  runChecks: { latest: { replay: null, regression: null, smoke: null }, history: { replay: [], regression: [], smoke: [] } },
   replayDatasets: [],
   selectedReplayDataset: "examples/replay_telemetry.csv",
+  trainingReplayDataset: "examples/replay_telemetry.csv",
   datasetManifest: null,
   artifacts: [],
   artifactRegistry: { promoted: {}, active_artifact_id: "unregistered" },
@@ -35,6 +38,7 @@ const state = {
   activeTrainingJobId: null,
   trainingPollTimer: null,
   externalLinks: [],
+  featureImportance: null,
 };
 
 const el = (id) => document.getElementById(id);
@@ -92,9 +96,20 @@ function metricValue(prefix) {
   return entry ? entry[1] : Number.NaN;
 }
 
+function latestRun(kind) {
+  return state.runChecks?.latest?.[kind] || null;
+}
+
 async function api(path, options = {}) {
   const response = await fetch(path, options);
   if (!response.ok) {
+    const type = response.headers.get("content-type") || "";
+    if (type.includes("application/json")) {
+      const body = await response.json();
+      const err = new Error(`${response.status} ${response.statusText}`);
+      err.detail = body.detail;
+      throw err;
+    }
     throw new Error(`${response.status} ${response.statusText}`);
   }
   const type = response.headers.get("content-type") || "";
@@ -110,18 +125,6 @@ function resolveInfraUrl(rawUrl) {
   if (!rawUrl) return "";
   try {
     const url = new URL(rawUrl, window.location.origin);
-    const loopbackHosts = new Set([
-      "localhost",
-      "127.0.0.1",
-      "0.0.0.0",
-      "::1",
-      "mlflow",
-      "grafana",
-      "prometheus",
-    ]);
-    if (loopbackHosts.has(url.hostname)) {
-      url.hostname = window.location.hostname;
-    }
     return serializeUrl(url);
   } catch (_error) {
     return rawUrl;
@@ -223,17 +226,32 @@ function setControls(status = null) {
   }
 }
 
+function setTabVisibility(id, active) {
+  const node = el(id);
+  node.hidden = !active;
+  node.style.display = active ? "grid" : "none";
+}
+
 function setActiveTab(name) {
   const live = name === "live";
-  const ops = name === "ops";
-  el("liveTab").classList.toggle("active", live);
-  el("opsTab").classList.toggle("active", ops);
-  el("historyTab").classList.toggle("active", !live && !ops);
+  const evaluation = name === "evaluation";
+  const promotion = name === "promotion";
+  const training = name === "training";
+  setTabVisibility("liveTab", live);
+  setTabVisibility("evaluationTab", evaluation);
+  setTabVisibility("promotionTab", promotion);
+  setTabVisibility("trainingTab", training);
+  setTabVisibility("historyTab", !live && !evaluation && !promotion && !training);
   el("liveTabButton").classList.toggle("active", live);
-  el("opsTabButton").classList.toggle("active", ops);
-  el("historyTabButton").classList.toggle("active", !live && !ops);
-  if (ops) { refreshOps(); refreshBenchmark(); }
-  if (!live && !ops) refreshHistory();
+  el("evaluationTabButton").classList.toggle("active", evaluation);
+  el("promotionTabButton").classList.toggle("active", promotion);
+  el("trainingTabButton").classList.toggle("active", training);
+  el("historyTabButton").classList.toggle("active", !live && !evaluation && !promotion && !training);
+  if (evaluation || promotion || training) {
+    refreshOps();
+    refreshBenchmark();
+  }
+  if (!live && !evaluation && !promotion && !training) refreshHistory();
 }
 
 async function refreshHealth() {
@@ -275,9 +293,15 @@ async function refreshModels() {
     const payload = await api("/models");
     el("modelSelect").value = payload.configured_backend || "auto";
     el("modelValue").textContent = payload.active_backend || "-";
-    await refreshArtifacts();
   } catch (error) {
     setNotice(`Could not load model list: ${error.message}`, "error");
+    return;
+  }
+
+  try {
+    await refreshArtifacts();
+  } catch (error) {
+    setNotice(`Could not load artifact list: ${error.message}`, "error");
   }
 }
 
@@ -292,7 +316,6 @@ async function refreshArtifacts() {
     const option = document.createElement("option");
     option.value = artifact.artifact_id;
     option.textContent = `${artifact.status} · ${artifact.artifact_id}`;
-    option.disabled = artifact.status !== "promoted";
     select.appendChild(option);
   }
   select.value = active === "unregistered" ? "" : active;
@@ -396,6 +419,14 @@ async function refreshMetrics() {
   renderOpsCharts();
 }
 
+async function settledRequest(label, promise) {
+  try {
+    return { label, status: "fulfilled", value: await promise };
+  } catch (error) {
+    return { label, status: "rejected", reason: error };
+  }
+}
+
 async function refreshOps() {
   try {
     const datasetPayload = await api("/data-sources/replay-datasets");
@@ -405,29 +436,66 @@ async function refreshOps() {
       || !state.replayDatasets.some((item) => item.path === state.selectedReplayDataset)
     ) {
       state.selectedReplayDataset =
-        state.replayDatasets.find((item) => item.path === "examples/replay_telemetry.csv")?.path
-        || state.replayDatasets[0]?.path
-        || "examples/replay_telemetry.csv";
+      state.replayDatasets.find((item) => item.path === "examples/replay_telemetry.csv")?.path
+      || state.replayDatasets[0]?.path
+      || "examples/replay_telemetry.csv";
     }
-    const [readiness, alerts, replayEvaluation, replaySuite, trainingJobsPayload] = await Promise.all([
-      api("/deployment/readiness?mode=production"),
-      api("/monitoring/alerts"),
-      api(`/evaluation/replay?dataset_path=${encodeURIComponent(state.selectedReplayDataset)}`),
-      api("/evaluation/replay-suite"),
-      api("/training/jobs"),
-      refreshMetrics(),
+    const [
+      readinessResult,
+      alertsResult,
+      replayEvaluationResult,
+      replaySuiteResult,
+      trainingJobsResult,
+      runChecksResult,
+      metricsResult,
+    ] = await Promise.all([
+      settledRequest("deployment/readiness", api("/deployment/readiness?mode=production")),
+      settledRequest("monitoring/alerts", api("/monitoring/alerts")),
+      settledRequest(
+        "evaluation/replay",
+        api(`/evaluation/replay?dataset_path=${encodeURIComponent(state.selectedReplayDataset)}`)
+      ),
+      settledRequest("evaluation/replay-suite", api("/evaluation/replay-suite")),
+      settledRequest("training/jobs", api("/training/jobs")),
+      settledRequest("ops/run-checks", api("/ops/run-checks")),
+      settledRequest("metrics", refreshMetrics()),
     ]);
-    state.readiness = readiness;
-    state.alerts = alerts;
-    state.replayEvaluation = replayEvaluation;
-    state.replaySuite = replaySuite;
-    state.trainingJobs = trainingJobsPayload.jobs || [];
+    state.readiness = readinessResult.status === "fulfilled" ? readinessResult.value : state.readiness;
+    state.alerts = alertsResult.status === "fulfilled" ? alertsResult.value : state.alerts;
+    state.replayEvaluation =
+      replayEvaluationResult.status === "fulfilled" ? replayEvaluationResult.value : state.replayEvaluation;
+    state.replaySuite = replaySuiteResult.status === "fulfilled" ? replaySuiteResult.value : state.replaySuite;
+    state.trainingJobs = trainingJobsResult.status === "fulfilled" ? (trainingJobsResult.value.jobs || []) : state.trainingJobs;
+    state.runChecks = runChecksResult.status === "fulfilled" ? (runChecksResult.value || state.runChecks) : state.runChecks;
+    state.replayRun = latestRun("replay");
+    state.regressionRun = latestRun("regression");
+    state.smokeRun = latestRun("smoke");
     await refreshDatasetManifest();
-    state.comparison = (await api("/monitoring/model-comparison")).models || [];
+    const comparison = await api("/monitoring/model-comparison");
+    state.comparison = comparison.models || [];
+    try {
+      state.featureImportance = await api("/monitoring/feature-importance");
+    } catch (_err) {
+      // feature importance optional — no model trained yet
+    }
     try {
       state.shadow = await api("/shadow/status");
     } catch (_err) {
       // shadow endpoint optional
+    }
+    if (readinessResult.status === "rejected" || alertsResult.status === "rejected" || replayEvaluationResult.status === "rejected" || replaySuiteResult.status === "rejected" || trainingJobsResult.status === "rejected" || runChecksResult.status === "rejected" || metricsResult.status === "rejected") {
+      const failures = [
+        readinessResult,
+        alertsResult,
+        replayEvaluationResult,
+        replaySuiteResult,
+        trainingJobsResult,
+        runChecksResult,
+        metricsResult,
+      ]
+        .filter((result) => result.status === "rejected")
+        .map((result) => `${result.label}: ${result.reason?.message || String(result.reason)}`);
+      setNotice(`Evaluation view loaded with partial data: ${failures[0]}`, "error");
     }
     renderOps();
   } catch (error) {
@@ -599,6 +667,32 @@ async function runRegressionCheck() {
   }
 }
 
+async function runSmokeCheck() {
+  const payload = {
+    replay_dataset_path: state.selectedReplayDataset,
+    regression_laps: Number(el("regressionLapsInput").value || 18),
+    regression_seed: Number(el("regressionSeedInput").value || 11),
+    probe_external_links: true,
+  };
+  try {
+    el("smokeRunButton").disabled = true;
+    el("runCheckState").textContent = "Running smoke…";
+    const result = await api("/deployment/smoke", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    state.smokeRun = result;
+    el("runCheckState").textContent = result.passed ? "Smoke pass" : "Smoke fail";
+    renderRunChecks();
+  } catch (error) {
+    setNotice(`Could not run deployment smoke: ${error.message}`, "error");
+    el("runCheckState").textContent = "Smoke error";
+  } finally {
+    el("smokeRunButton").disabled = false;
+  }
+}
+
 function setExportSourceTab(source) {
   el("fastf1ExportForm").hidden = source !== "fastf1";
   el("openf1ExportForm").hidden = source !== "openf1";
@@ -631,6 +725,32 @@ async function exportOpenF1Session() {
   } finally {
     el("openf1ExportButton").disabled = false;
     el("openf1ExportButton").textContent = "Export";
+  }
+}
+
+async function exportOpenF1FleetIntervals() {
+  const payload = {
+    year: Number(el("openf1YearInput").value || 2024),
+    event: el("openf1EventInput").value || "Bahrain",
+    session: el("openf1SessionInput").value || "Race",
+  };
+  try {
+    el("openf1FleetExportButton").disabled = true;
+    el("openf1FleetExportButton").textContent = "Exporting…";
+    const manifest = await api("/data-sources/openf1/fleet-export", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+    const drivers = manifest.driver_count || "?";
+    const laps = manifest.lap_count || "?";
+    setNotice(`Fleet intervals exported: ${manifest.output} (${drivers} drivers × ${laps} laps)`);
+    await refreshOps();
+  } catch (error) {
+    setNotice(`Fleet intervals export failed: ${error.message}`, "error");
+  } finally {
+    el("openf1FleetExportButton").disabled = false;
+    el("openf1FleetExportButton").textContent = "Export Fleet";
   }
 }
 
@@ -820,11 +940,15 @@ function resetDashboard() {
   el("replayRunGates").innerHTML = "";
   el("regressionSummary").innerHTML = "";
   el("regressionChecks").innerHTML = "";
+  el("smokeSummary").innerHTML = "";
+  el("smokeChecks").innerHTML = "";
   el("runCheckState").textContent = "Idle";
   el("replayRunState").textContent = "Ready";
   el("regressionRunState").textContent = "Ready";
+  el("smokeRunState").textContent = "Ready";
   state.replayRun = null;
   state.regressionRun = null;
+  state.smokeRun = null;
   el("dataSourceState").textContent = "No datasets";
   el("replayDatasetRows").innerHTML = `<tr><td colspan="8">No replay datasets</td></tr>`;
   el("datasetDetailGrid").innerHTML = "";
@@ -855,6 +979,19 @@ function renderStrategy() {
   el("undercutValue").textContent = pct(pit.undercut_success_probability);
   el("safetyValue").textContent = pct(pit.safety_car_sensitivity);
   el("paceTarget").textContent = `${num(strategy.pace_target_delta_s, 3)}s`;
+
+  const cliffEl = el("cliffLapEstimate");
+  if (cliffEl) {
+    cliffEl.textContent = strategy.cliff_lap_estimate > 0 ? `Lap ${strategy.cliff_lap_estimate}` : "-";
+  }
+  const undercutWinEl = el("undercutWindowValue");
+  if (undercutWinEl) {
+    undercutWinEl.textContent = pit.undercut_window_laps > 0 ? `${pit.undercut_window_laps} lap(s)` : "None";
+  }
+  const overcutWinEl = el("overcutWindowValue");
+  if (overcutWinEl) {
+    overcutWinEl.textContent = pit.overcut_window_laps > 0 ? `${pit.overcut_window_laps} lap(s)` : "None";
+  }
 
   const bars = el("deploymentBars");
   bars.innerHTML = "";
@@ -958,57 +1095,66 @@ function renderOps() {
   const alerts = state.alerts?.alerts || readiness?.alerts || [];
   if (!readiness) {
     el("readinessState").textContent = "Waiting";
-    return;
-  }
-  el("deploymentReadyValue").textContent = readiness.ready ? "Ready" : "Blocked";
-  el("deploymentReadyValue").className = readiness.ready ? "risk-low" : "risk-high";
-  el("healthScoreValue").textContent = `${num(readiness.health_score, 0)}`;
-  el("alertCountValue").textContent = readiness.alert_count;
-  const rollback = readiness.rollback_candidate;
-  el("rollbackValue").textContent = rollback ? shortRunId(rollback.artifact_id) : "None";
-  el("rollbackValue").title = rollback?.artifact_id || "";
-  const health = state.health;
-  if (health) {
-    const fs = health.feature_store_backend || "memory";
-    el("featureStoreValue").textContent = fs;
-    el("featureStoreValue").className = fs === "redis" ? "risk-low" : "risk-medium";
-    renderDriftWarmup(health.drift_baseline_fitted, health.drift_ingest_count || 0);
-  }
-  renderArtifactAlignment(readiness);
-  el("readinessState").textContent =
-    `${readiness.mode || "local"} / ${readiness.active_backend} / ${readiness.active_artifact_id}`;
-  el("alertState").textContent = `${alerts.length} active`;
-  renderReplayDataSources();
-  renderReplayEvaluation();
-  renderRunChecks();
-
-  const checks = el("readinessChecks");
-  checks.innerHTML = "";
-  for (const [name, passed] of Object.entries(readiness.checks || {})) {
-    const item = document.createElement("div");
-    item.className = `check-item ${passed ? "pass" : "fail"}`;
-    item.innerHTML = `<span>${name.replaceAll("_", " ")}</span><strong>${passed ? "Pass" : "Fail"}</strong>`;
-    checks.appendChild(item);
-  }
-
-  const list = el("alertList");
-  list.innerHTML = "";
-  if (!alerts.length) {
-    list.innerHTML = `<div class="alert-item"><span>No active alerts</span><strong>Clear</strong></div>`;
+    el("deploymentReadyValue").textContent = "-";
+    el("healthScoreValue").textContent = "-";
+    el("alertCountValue").textContent = "-";
+    el("rollbackValue").textContent = "-";
+    el("featureStoreValue").textContent = "-";
+    el("activeArtifactValue").textContent = "-";
+    el("promotedArtifactValue").textContent = "-";
+    el("readinessChecks").innerHTML = "";
+    el("alertList").innerHTML = "";
   } else {
-    for (const alert of alerts) {
+    el("deploymentReadyValue").textContent = readiness.ready ? "Ready" : "Blocked";
+    el("deploymentReadyValue").className = readiness.ready ? "risk-low" : "risk-high";
+    el("healthScoreValue").textContent = `${num(readiness.health_score, 0)}`;
+    el("alertCountValue").textContent = readiness.alert_count;
+    const rollback = readiness.rollback_candidate;
+    el("rollbackValue").textContent = rollback ? shortRunId(rollback.artifact_id) : "None";
+    el("rollbackValue").title = rollback?.artifact_id || "";
+    const health = state.health;
+    if (health) {
+      const fs = health.feature_store_backend || "memory";
+      el("featureStoreValue").textContent = fs;
+      el("featureStoreValue").className = fs === "redis" ? "risk-low" : "risk-medium";
+      renderDriftWarmup(health.drift_baseline_fitted, health.drift_ingest_count || 0);
+    }
+    renderArtifactAlignment(readiness);
+    el("readinessState").textContent =
+      `${readiness.mode || "local"} / ${readiness.active_backend} / ${readiness.active_artifact_id}`;
+    el("alertState").textContent = `${alerts.length} active`;
+    const checks = el("readinessChecks");
+    checks.innerHTML = "";
+    for (const [name, passed] of Object.entries(readiness.checks || {})) {
       const item = document.createElement("div");
-      item.className = `alert-item ${alert.severity}`;
-      item.innerHTML = `
-        <span>${alert.type.replaceAll("_", " ")}</span>
-        <strong>${alert.severity}</strong>
-        <small>${alert.message}</small>
-      `;
-      list.appendChild(item);
+      item.className = `check-item ${passed ? "pass" : "fail"}`;
+      item.innerHTML = `<span>${name.replaceAll("_", " ")}</span><strong>${passed ? "Pass" : "Fail"}</strong>`;
+      checks.appendChild(item);
+    }
+    const list = el("alertList");
+    list.innerHTML = "";
+    if (!alerts.length) {
+      list.innerHTML = `<div class="alert-item"><span>No active alerts</span><strong>Clear</strong></div>`;
+    } else {
+      for (const alert of alerts) {
+        const item = document.createElement("div");
+        item.className = `alert-item ${alert.severity}`;
+        item.innerHTML = `
+          <span>${alert.type.replaceAll("_", " ")}</span>
+          <strong>${alert.severity}</strong>
+          <small>${alert.message}</small>
+        `;
+        list.appendChild(item);
+      }
     }
   }
+  renderReplayDataSources();
+  populateTrainingReplayDatasetSelect();
+  renderReplayEvaluation();
+  renderRunChecks();
   renderOpsCharts();
   renderModelComparison();
+  renderFeatureImportance();
   renderArtifactRelease();
   renderShadow();
   renderLiveData();
@@ -1019,6 +1165,7 @@ function renderOps() {
 function renderRunChecks() {
   renderReplayRun();
   renderRegressionRun();
+  renderSmokeRun();
 }
 
 function renderReplayRun() {
@@ -1027,14 +1174,16 @@ function renderReplayRun() {
   const gates = el("replayRunGates");
   if (!summary || !gates) return;
   if (!payload) {
+    el("replayRunState").textContent = "Ready";
     summary.innerHTML = "";
     gates.innerHTML = "";
     return;
   }
+  el("replayRunState").textContent = payload.kind || "dataset";
   summary.innerHTML = "";
   gates.innerHTML = "";
-  const report = payload.report || null;
   const suite = payload.suite || null;
+  const report = payload.report || null;
   const items = report
     ? [
         ["Dataset", shortRunId(report.dataset_path)],
@@ -1080,98 +1229,6 @@ function renderRegressionRun() {
   const checks = el("regressionChecks");
   if (!summary || !checks) return;
   if (!payload) {
-    summary.innerHTML = "";
-    checks.innerHTML = "";
-    return;
-  }
-  summary.innerHTML = "";
-  checks.innerHTML = "";
-  const items = [
-    ["Laps", payload.config?.laps ?? "-"],
-    ["Seed", payload.config?.seed ?? "-"],
-    ["Latency", payload.config?.target_latency_ms != null ? `${num(payload.config.target_latency_ms, 1)} ms` : "auto"],
-    ["Oscillation", payload.config?.max_temporal_oscillation_s != null ? `${num(payload.config.max_temporal_oscillation_s, 2)} s` : "auto"],
-    ["Min Width", `${num(payload.config?.min_calibration_width_s, 2)} s`],
-    ["Max Width", payload.config?.max_calibration_width_s != null ? `${num(payload.config.max_calibration_width_s, 2)} s` : "auto"],
-  ];
-  for (const [label, value] of items) {
-    const item = document.createElement("div");
-    item.className = "detail-item";
-    item.innerHTML = `<span>${label}</span><strong title="${value}">${value}</strong>`;
-    summary.appendChild(item);
-  }
-  for (const result of payload.results || []) {
-    const item = document.createElement("div");
-    item.className = `check-item ${result.passed ? "pass" : "fail"}`;
-    item.innerHTML = `<span>${result.name.replaceAll("_", " ")}</span><strong>${num(result.value, 4)} / ${num(result.threshold, 4)}</strong>`;
-    checks.appendChild(item);
-  }
-}
-
-function renderRunChecks() {
-  renderReplayRun();
-  renderRegressionRun();
-}
-
-function renderReplayRun() {
-  const payload = state.replayRun;
-  const summary = el("replayRunSummary");
-  const gates = el("replayRunGates");
-  if (!payload) {
-    el("replayRunState").textContent = "Ready";
-    summary.innerHTML = "";
-    gates.innerHTML = "";
-    return;
-  }
-  el("replayRunState").textContent = payload.kind || "dataset";
-  summary.innerHTML = "";
-  gates.innerHTML = "";
-  const suite = payload.suite || null;
-  const report = payload.report || null;
-  const items = report
-    ? [
-        ["Dataset", shortRunId(report.dataset_path)],
-        ["Trust", replayTrust(report.data_provenance || {}).label],
-        ["Signal", report.data_provenance?.validation_signal || "-"],
-        ["Labels", `${report.labeled_event_count} / ${report.event_count}`],
-        ["MAE", `${num(report.scenario?.mae_lap_delta_s, 4)}s`],
-        ["Coverage", `${num(report.scenario?.coverage_pct, 1)}%`],
-        ["Calibration", `${num(report.scenario?.calibration_error_pct, 1)}%`],
-        ["Width", `${num(report.scenario?.mean_interval_width_s, 3)}s`],
-      ]
-    : suite
-      ? [
-          ["Suite", suite.suite_name || payload.kind || "-"],
-          ["Splits", suite.split_count ?? "-"],
-          ["Events", suite.total_event_count ?? "-"],
-          ["Labels", suite.total_labeled_event_count ?? "-"],
-          ["MAE", `${num(suite.mean_mae_lap_delta_s, 4)}s`],
-          ["Coverage", `${num(suite.mean_coverage_pct, 1)}%`],
-        ]
-      : [];
-  for (const [label, value] of items) {
-    const item = document.createElement("div");
-    item.className = "detail-item";
-    item.innerHTML = `<span>${label}</span><strong title="${value}">${value}</strong>`;
-    summary.appendChild(item);
-  }
-  const target = report?.gates || suite?.splits?.reduce((acc, split, index) => {
-    acc[`split_${index + 1}`] = split.passed;
-    return acc;
-  }, {}) || {};
-  for (const [name, passed] of Object.entries(target)) {
-    const item = document.createElement("div");
-    item.className = `check-item ${passed ? "pass" : "fail"}`;
-    item.innerHTML = `<span>${String(name).replaceAll("_", " ")}</span><strong>${passed ? "Pass" : "Fail"}</strong>`;
-    gates.appendChild(item);
-  }
-}
-
-function renderRegressionRun() {
-  const payload = state.regressionRun;
-  const summary = el("regressionSummary");
-  const checks = el("regressionChecks");
-  if (!payload) {
     el("regressionRunState").textContent = "Ready";
     summary.innerHTML = "";
     checks.innerHTML = "";
@@ -1202,9 +1259,45 @@ function renderRegressionRun() {
   }
 }
 
+function renderSmokeRun() {
+  const payload = state.smokeRun;
+  const summary = el("smokeSummary");
+  const checks = el("smokeChecks");
+  if (!summary || !checks) return;
+  if (!payload) {
+    el("smokeRunState").textContent = "Ready";
+    summary.innerHTML = "";
+    checks.innerHTML = "";
+    return;
+  }
+  el("smokeRunState").textContent = payload.passed ? "Pass" : "Fail";
+  summary.innerHTML = "";
+  checks.innerHTML = "";
+  const items = [
+    ["Model", payload.model_backend || "-"],
+    ["Artifact", payload.artifact_id || "-"],
+    ["Replay", payload.replay?.scenario?.source || "-"],
+    ["Benchmark", payload.benchmark?.suite_name || "-"],
+    ["Regression", payload.regression?.passed ? "Pass" : "Fail"],
+    ["Links", payload.external_links?.filter((item) => item.external).length ?? 0],
+  ];
+  for (const [label, value] of items) {
+    const item = document.createElement("div");
+    item.className = "detail-item";
+    item.innerHTML = `<span>${label}</span><strong title="${value}">${value}</strong>`;
+    summary.appendChild(item);
+  }
+  for (const check of payload.checks || []) {
+    const item = document.createElement("div");
+    item.className = `check-item ${check.passed ? "pass" : "fail"}`;
+    item.innerHTML = `<span>${check.name.replaceAll("_", " ")}</span><strong>${check.passed ? "Pass" : "Fail"}</strong>`;
+    checks.appendChild(item);
+  }
+}
+
 function renderArtifactAlignment(readiness) {
-  const active = readiness.active_artifact_id || state.artifactRegistry.active_artifact_id || "unregistered";
-  const promoted = promotedArtifactForBackend(readiness.active_backend);
+  const active = readiness?.active_artifact_id || state.artifactRegistry.active_artifact_id || "unregistered";
+  const promoted = promotedArtifactForBackend(readiness?.active_backend);
   const aligned = active !== "unregistered" && promoted && active === promoted;
   el("activeArtifactValue").textContent = shortRunId(active);
   el("activeArtifactValue").title = active;
@@ -1232,13 +1325,14 @@ function renderReplayDataSources() {
   populateLiveDatasetSelect();
   populateTrainingRealDataSelect();
   if (!datasets.length) {
-    rows.innerHTML = `<tr><td colspan="8">No replay datasets</td></tr>`;
+    rows.innerHTML = `<tr><td colspan="9">No replay datasets</td></tr>`;
     renderDatasetDetail(null);
     return;
   }
   for (const dataset of datasets) {
     const provenance = dataset.data_provenance || {};
     const productionReady = provenance.production_validation_ready === true;
+    const hasFleet = dataset.has_fleet_intervals === true;
     const option = document.createElement("option");
     option.value = dataset.path;
     option.textContent = dataset.path;
@@ -1257,6 +1351,7 @@ function renderReplayDataSources() {
       <td>${provenance.lap_time_label || "-"}</td>
       <td class="${productionReady ? "risk-low" : "risk-medium"}">${productionReady ? "Yes" : "No"}</td>
       <td class="${dataset.has_manifest ? "risk-low" : "risk-medium"}">${dataset.has_manifest ? "Yes" : "No"}</td>
+      <td class="${hasFleet ? "risk-low" : "risk-medium"}" title="${hasFleet ? dataset.fleet_intervals_path : "Run Export Fleet to generate"}">${hasFleet ? "Yes" : "No"}</td>
     `;
     row.addEventListener("click", () => selectReplayDataset(dataset.path));
     row.addEventListener("keydown", (event) => {
@@ -1295,6 +1390,7 @@ function renderDatasetDetail(dataset) {
     ["Labels", dataset.labeled_event_count ?? "-"],
     ["Laps", dataset.lap_count ?? manifest.lap_count ?? "-"],
     ["Manifest", dataset.has_manifest ? "Available" : "Missing"],
+    ["Fleet Intervals", dataset.has_fleet_intervals ? "Available" : "Missing — use Export Fleet"],
     ["Fingerprint", shortRunId(dataset.dataset_fingerprint || manifest.dataset_fingerprint || "-")],
     ["Generated", manifest.generated_at ? shortRunId(manifest.generated_at) : "-"],
   ];
@@ -1434,18 +1530,101 @@ function renderReplaySuite(suite, targetId) {
   }
 }
 
+function activeComparisonBackend() {
+  return state.readiness?.active_backend || state.health?.model_backend || "";
+}
+
+function comparisonVerdict(row, bestRow) {
+  if (!row) return { label: "-", className: "performance-muted" };
+  const bestMae = bestRow?.mae_lap_delta_s ?? row.mae_lap_delta_s;
+  const maeGap = row.mae_lap_delta_s - bestMae;
+  if (row.rank === 1 || maeGap <= 0.005) {
+    return { label: "Leading", className: "performance-good" };
+  }
+  if (maeGap <= 0.03 || row.health_score >= 80) {
+    return { label: "Competitive", className: "performance-warn" };
+  }
+  return { label: "Lagging", className: "performance-bad" };
+}
+
+function comparisonRecommendation(row, bestRow) {
+  const recommendation = row?.recommendation;
+  if (recommendation?.action) {
+    return {
+      label: recommendation.action,
+      className: `performance-action-${recommendation.action}`,
+      title: recommendation.reason || recommendation.action,
+    };
+  }
+  if (!row) {
+    return { label: "-", className: "performance-muted", title: "-" };
+  }
+  const bestMae = bestRow?.mae_lap_delta_s ?? row.mae_lap_delta_s;
+  const maeGap = row.mae_lap_delta_s - bestMae;
+  if (row.rank === 1 && row.health_score >= 80 && row.interval_coverage_pct >= 90 && row.alert_count === 0) {
+    return { label: "promote", className: "performance-action-promote", title: "Best observed performer with strong coverage and no alerts" };
+  }
+  if (row.critical_alert_count > 0 || row.health_score < 55 || row.interval_coverage_pct < 75 || maeGap > 0.08) {
+    return { label: "retire", className: "performance-action-retire", title: "High error, weak coverage, or critical alerts" };
+  }
+  return { label: "hold", className: "performance-action-hold", title: "Needs more evidence before promotion" };
+}
+
+function renderComparisonSummary(rows) {
+  const summary = el("comparisonSummary");
+  const active = activeComparisonBackend();
+  const activeRow = rows.find((row) => row.backend === active) || rows[0] || null;
+  const bestRow = rows[0] || null;
+  if (!summary) return;
+  if (!rows.length || !activeRow) {
+    el("comparisonModelValue").textContent = active || "-";
+    el("comparisonRankValue").textContent = "-";
+    el("comparisonGapValue").textContent = "-";
+    el("comparisonVerdictValue").textContent = "-";
+    el("comparisonActionValue").textContent = "-";
+    summary.querySelectorAll(".performance-chip").forEach((chip) => {
+      chip.className = "performance-chip";
+    });
+    return;
+  }
+
+  const verdict = comparisonVerdict(activeRow, bestRow);
+  const action = comparisonRecommendation(activeRow, bestRow);
+  const bestMae = bestRow?.mae_lap_delta_s ?? activeRow.mae_lap_delta_s;
+  const maeGap = activeRow.mae_lap_delta_s - bestMae;
+  const coverageGap = (bestRow?.interval_coverage_pct ?? activeRow.interval_coverage_pct) - activeRow.interval_coverage_pct;
+  el("comparisonModelValue").textContent = activeRow.backend || "-";
+  el("comparisonRankValue").textContent = `#${activeRow.rank ?? "-"}`;
+  el("comparisonGapValue").textContent = `${maeGap > 0 ? "+" : ""}${num(maeGap, 4)}s / ${num(coverageGap, 1)}% cov`;
+  el("comparisonVerdictValue").textContent = verdict.label;
+  el("comparisonActionValue").textContent = action.label;
+  el("comparisonActionValue").title = action.title;
+
+  const chips = summary.querySelectorAll(".performance-chip");
+  if (chips[0]) chips[0].className = `performance-chip ${activeRow.rank === 1 ? "performance-good" : "performance-muted"}`;
+  if (chips[1]) chips[1].className = `performance-chip ${activeRow.rank === 1 ? "performance-good" : activeRow.rank <= 3 ? "performance-warn" : "performance-bad"}`;
+  if (chips[2]) chips[2].className = `performance-chip ${maeGap <= 0.005 ? "performance-good" : maeGap <= 0.03 ? "performance-warn" : "performance-bad"}`;
+  if (chips[3]) chips[3].className = `performance-chip ${verdict.className}`;
+  if (chips[4]) chips[4].className = `performance-chip ${action.className}`;
+}
+
 function renderModelComparison() {
   const rows = state.comparison || [];
   const table = el("comparisonRows");
   table.innerHTML = "";
-  el("comparisonState").textContent = rows.length ? `${rows.length} evaluated` : "No evaluated models";
+  const active = activeComparisonBackend();
+  el("comparisonState").textContent = rows.length
+    ? `${rows.length} evaluated${active ? ` · active ${active}` : ""}`
+    : "No evaluated models";
   if (!rows.length) {
-    table.innerHTML = `<tr><td colspan="9">Run at least one full lap per model</td></tr>`;
+    table.innerHTML = `<tr><td colspan="10">Run at least one full lap per model</td></tr>`;
+    renderComparisonSummary([]);
     drawComparisonChart([]);
     return;
   }
   for (const row of rows) {
     const item = document.createElement("tr");
+    item.className = row.backend === active ? "selected" : "";
     item.innerHTML = `
       <td>${row.rank}</td>
       <td>${row.backend}</td>
@@ -1454,12 +1633,41 @@ function renderModelComparison() {
       <td>${num(row.mae_lap_delta_s, 4)}s</td>
       <td>${num(row.rmse_lap_delta_s, 4)}s</td>
       <td>${num(row.interval_coverage_pct, 1)}%</td>
+      <td><span class="decision-pill decision-${row.recommendation?.action || "hold"}" title="${row.recommendation?.reason || ""}">${row.recommendation?.action || "hold"}</span></td>
       <td>${num(row.health_score, 0)}</td>
       <td>${row.alert_count}</td>
     `;
     table.appendChild(item);
   }
+  renderComparisonSummary(rows);
   drawComparisonChart(rows);
+}
+
+function renderFeatureImportance() {
+  const container = el("featureImportanceBars");
+  const stateEl = el("featureImportanceState");
+  const data = state.featureImportance;
+  if (!data || !data.available) {
+    stateEl.textContent = "Unavailable";
+    container.innerHTML = `<span class="muted">Feature importance not yet available — train a model first.</span>`;
+    return;
+  }
+  const items = (data.importance || []).slice(0, 20);
+  stateEl.textContent = `${data.backend} · top ${items.length} features`;
+  container.innerHTML = "";
+  const maxPct = items[0]?.pct || 1;
+  for (const item of items) {
+    const row = document.createElement("div");
+    row.className = "fi-row";
+    const barWidth = Math.max(2, (item.pct / maxPct) * 100).toFixed(1);
+    row.innerHTML = `
+      <span class="fi-rank">#${item.rank}</span>
+      <span class="fi-name" title="${item.name}">${item.name}</span>
+      <div class="fi-bar-wrap"><div class="fi-bar" style="width:${barWidth}%"></div></div>
+      <span class="fi-pct">${num(item.pct, 1)}%</span>
+    `;
+    container.appendChild(row);
+  }
 }
 
 function renderArtifactRelease() {
@@ -1479,6 +1687,8 @@ function renderArtifactRelease() {
   }
   for (const artifact of artifacts) {
     const replayPassed = artifact.replay_passed;
+    const replayState = replayPassed === true ? "Pass" : replayPassed === false ? "Fail" : "Missing";
+    const replayStateClass = replayPassed === true ? "risk-low" : replayPassed === false ? "risk-high" : "risk-medium";
     const productionReady = artifact.production_validation_ready === true;
     const item = document.createElement("tr");
     item.className = artifact.artifact_id === state.selectedArtifactId ? "selected" : "";
@@ -1487,7 +1697,7 @@ function renderArtifactRelease() {
     item.innerHTML = `
       <td>${shortRunId(artifact.artifact_id)}</td>
       <td>${artifact.status || "-"}</td>
-      <td class="${replayPassed === true ? "risk-low" : "risk-high"}">${replayPassed === true ? "Pass" : "Missing"}</td>
+      <td class="${replayStateClass}">${replayState}</td>
       <td>${artifact.replay_validation_signal || "-"}</td>
       <td class="${productionReady ? "risk-low" : "risk-medium"}">${productionReady ? "Yes" : "No"}</td>
       <td>${num(artifact.replay_mae_lap_delta_s, 4)}s</td>
@@ -2162,12 +2372,15 @@ async function stopLiveData() {
 
 function scheduleLivePoll() {
   clearTimeout(state.liveTimer);
+  const interval = state.liveStatus?.connected ? 200 : 900;
   state.liveTimer = setTimeout(async () => {
     try {
       state.liveStatus = await api("/live-data/status");
-      const pred = latestPrediction();
-      if (pred) state.livePredictions.push(pred);
-      state.livePredictions = state.livePredictions.slice(-80);
+      const pred = state.liveStatus?.latest_prediction;
+      if (pred) {
+        state.livePredictions.push(pred);
+        state.livePredictions = state.livePredictions.slice(-80);
+      }
       renderLiveData();
       if (state.liveStatus?.connected) scheduleLivePoll();
       else {
@@ -2179,7 +2392,7 @@ function scheduleLivePoll() {
     } catch (_err) {
       scheduleLivePoll();
     }
-  }, 900);
+  }, interval);
 }
 
 function renderLiveData() {
@@ -2318,9 +2531,29 @@ function populateTrainingRealDataSelect() {
   }
 }
 
+function populateTrainingReplayDatasetSelect() {
+  const select = el("trainingReplayDatasetSelect");
+  if (!select) return;
+  const prevValue = select.value || state.trainingReplayDataset || state.selectedReplayDataset;
+  select.innerHTML = "";
+  for (const dataset of state.replayDatasets || []) {
+    const opt = document.createElement("option");
+    opt.value = dataset.path;
+    opt.textContent = dataset.path;
+    select.appendChild(opt);
+  }
+  const fallback =
+    state.replayDatasets.find((dataset) => dataset.path === state.selectedReplayDataset)?.path
+    || state.replayDatasets[0]?.path
+    || "examples/replay_telemetry.csv";
+  select.value = state.replayDatasets.some((dataset) => dataset.path === prevValue) ? prevValue : fallback;
+  state.trainingReplayDataset = select.value || fallback;
+}
+
 async function runTraining() {
   const baselapRaw = el("trainingBaselapInput").value.trim();
   const selectedPaths = Array.from(el("trainingRealDataSelect").selectedOptions).map((o) => o.value);
+  const replayDatasetPath = el("trainingReplayDatasetSelect").value || state.trainingReplayDataset || state.selectedReplayDataset;
   const payload = {
     backend: el("trainingBackendSelect").value,
     laps: Number(el("trainingLapsInput").value || 28),
@@ -2328,19 +2561,21 @@ async function runTraining() {
     rounds: Number(el("trainingRoundsInput").value || 140),
     base_lap_time_s: baselapRaw ? Number(baselapRaw) : null,
     real_data: selectedPaths.length ? selectedPaths : null,
+    replay_dataset_path: replayDatasetPath,
     use_mlflow: el("trainingMlflowInput").checked,
     register_artifact: el("trainingRegisterInput").checked,
   };
   try {
     el("trainingRunButton").disabled = true;
     el("trainingState").textContent = "Starting…";
+    state.trainingReplayDataset = replayDatasetPath;
     const result = await api("/training/run", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(payload),
     });
     state.activeTrainingJobId = result.job_id;
-    setNotice(`Training job started: ${result.job_id} (${result.backend})`);
+    setNotice(`Training job started: ${result.job_id} (${result.backend}) · replay ${shortRunId(replayDatasetPath)}`);
     scheduleTrainingPoll();
   } catch (error) {
     el("trainingRunButton").disabled = false;
@@ -2406,6 +2641,7 @@ function renderTrainingJobs() {
         <span class="training-job-status">${job.status}</span>
         <span class="training-job-elapsed">${elapsed}</span>
       </div>
+      ${job.replay_dataset_path ? `<div class="training-job-artifact" title="${job.replay_dataset_path}">replay: ${shortRunId(job.replay_dataset_path)}</div>` : ""}
       ${job.artifact_id ? `<div class="training-job-artifact" title="${job.artifact_id}">artifact: ${shortRunId(job.artifact_id)}</div>` : ""}
       ${job.error ? `<div class="training-job-error">${job.error}</div>` : ""}
       ${(job.log || []).slice(-2).map((line) => `<div class="training-job-log">${line}</div>`).join("")}
@@ -2414,13 +2650,62 @@ function renderTrainingJobs() {
   }
 }
 
+el("promoteArtifactBtn").addEventListener("click", () => promoteSelectedArtifact(false));
+el("forcePromoteArtifactBtn").addEventListener("click", () => promoteSelectedArtifact(true));
+el("deployArtifactBtn").addEventListener("click", deploySelectedArtifact);
+async function promoteSelectedArtifact(force) {
+  const id = state.selectedArtifactId;
+  if (!id) { setNotice("Select an artifact first.", "error"); return; }
+  try {
+    el("promoteArtifactBtn").disabled = true;
+    el("forcePromoteArtifactBtn").disabled = true;
+    const url = `/artifacts/${encodeURIComponentPath(id)}/promote${force ? "?force=true" : ""}`;
+    await api(url, { method: "POST" });
+    setNotice(`Promoted: ${id}`);
+    await refreshArtifacts();
+  } catch (error) {
+    const detail = error.detail;
+    let msg;
+    if (detail && typeof detail === "object" && Array.isArray(detail.failures)) {
+      msg = detail.failures.join(" · ");
+    } else if (typeof detail === "string") {
+      msg = detail;
+    } else {
+      msg = error.message;
+    }
+    setNotice(`Promotion blocked — ${msg}`, "error");
+  } finally {
+    el("promoteArtifactBtn").disabled = false;
+    el("forcePromoteArtifactBtn").disabled = false;
+  }
+}
+
+async function deploySelectedArtifact() {
+  const id = state.selectedArtifactId;
+  if (!id) { setNotice("Select an artifact first.", "error"); return; }
+  try {
+    el("deployArtifactBtn").disabled = true;
+    const payload = await api(`/model/artifact?artifact_id=${encodeURIComponent(id)}`, { method: "POST" });
+    el("modelValue").textContent = payload.active_backend || "-";
+    setNotice(`Deployed: ${payload.active_artifact_id} (${payload.active_backend})`);
+    await refreshHealth();
+    await refreshArtifacts();
+  } catch (error) {
+    setNotice(`Deploy failed: ${error.message}`, "error");
+  } finally {
+    el("deployArtifactBtn").disabled = false;
+  }
+}
+
 el("shadowEnableButton").addEventListener("click", enableShadow);
 el("shadowDisableButton").addEventListener("click", disableShadow);
 el("shadowPromoteViewBtn").addEventListener("click", promoteShadowChallenger);
 el("trainingRunButton").addEventListener("click", runTraining);
+el("openf1FleetExportButton").addEventListener("click", exportOpenF1FleetIntervals);
 el("validateDatasetButton").addEventListener("click", runReplayCheck);
 el("replayRunButton").addEventListener("click", runReplayCheck);
 el("regressionRunButton").addEventListener("click", runRegressionCheck);
+el("smokeRunButton").addEventListener("click", runSmokeCheck);
 el("replayModeBtn").addEventListener("click", () => setLiveMode("replay"));
 el("liveModeBtn").addEventListener("click", () => setLiveMode("live"));
 el("liveReplayStartBtn").addEventListener("click", startLiveReplay);
@@ -2428,9 +2713,12 @@ el("liveStopBtn").addEventListener("click", stopLiveData);
 el("liveTimingStartBtn").addEventListener("click", startLiveTiming);
 el("liveTimingStopBtn").addEventListener("click", stopLiveData);
 el("liveTabButton").addEventListener("click", () => setActiveTab("live"));
+el("evaluationTabButton").addEventListener("click", () => setActiveTab("evaluation"));
+el("promotionTabButton").addEventListener("click", () => setActiveTab("promotion"));
+el("trainingTabButton").addEventListener("click", () => setActiveTab("training"));
 el("historyTabButton").addEventListener("click", () => setActiveTab("history"));
-el("opsTabButton").addEventListener("click", () => setActiveTab("ops"));
 
+setActiveTab("live");
 refreshHealth();
 refreshModels();
 refreshMetrics().catch(() => {});

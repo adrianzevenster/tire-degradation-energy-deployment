@@ -1,0 +1,63 @@
+groups:
+  - name: f1-strategy-api
+    interval: 30s
+    rules:
+
+      - alert: F1APIDown
+        expr: up{job="f1-strategy-api"} == 0
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "F1 Strategy API is unreachable"
+          description: "The /metrics endpoint on api:8000 has not responded for >2 minutes."
+
+      - alert: F1HighInferenceLatency
+        expr: f1_prediction_latency_ms_p95 > 50
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Inference latency p95 > 50 ms"
+          description: "p95 latency is {{ $value | printf \"%.1f\" }} ms (threshold 50 ms)."
+
+      - alert: F1ModelHighMAE
+        expr: f1_mae > 0.5
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Model MAE exceeds 0.5 s"
+          description: "Rolling MAE is {{ $value | printf \"%.3f\" }} s. Consider retraining."
+
+      - alert: F1DriftDetected
+        expr: |
+          max without(feature) (
+            max_over_time(f1_drift_z_score_mean_tire_temp[5m]) or
+            max_over_time(f1_drift_z_score_track_temp_c[5m]) or
+            max_over_time(f1_drift_z_score_fuel_kg[5m])
+          ) > 3
+        for: 3m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Feature drift detected"
+          description: "At least one feature z-score exceeds 3.0 for >3 minutes."
+
+      - alert: F1NoPredictions
+        expr: increase(f1_predictions_total[10m]) == 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "No predictions in the last 10 minutes"
+          description: "The prediction counter has not increased. Check live-data pipeline."
+
+      - alert: F1HighDriftAlertRate
+        expr: increase(f1_drift_alerts_total[15m]) > 10
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "High drift alert rate"
+          description: "{{ $value | printf \"%.0f\" }} drift alerts fired in the last 15 minutes."

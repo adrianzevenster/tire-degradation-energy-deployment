@@ -32,7 +32,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e ".[api,observability]"
-          python -m pip install build
+          python -m pip install build dvc>=3.0
 
       - name: Install lint and type tooling
         run: python -m pip install ruff mypy
@@ -60,6 +60,45 @@ jobs:
           python -m f1_strategy.replay --benchmark
           python -m f1_strategy.evaluation --format json --output reports/model-evaluation.json
           python -m f1_strategy.evaluation --format markdown --output reports/model-evaluation.md
+
+      - name: DVC metrics diff
+        if: ${{ hashFiles('dvc.lock') != '' }}
+        run: |
+          dvc metrics show --md >> $GITHUB_STEP_SUMMARY || true
+          dvc metrics diff --md >> $GITHUB_STEP_SUMMARY || true
+
+      - name: Inference latency benchmark
+        run: |
+          python - <<'PY'
+          import time
+          from f1_strategy.engine import InferenceEngine
+          from f1_strategy.simulation import RaceSimulator, SimulationConfig
+
+          engine = InferenceEngine()
+          event = RaceSimulator(SimulationConfig(laps=1, seed=42)).events()[-1]
+
+          # Warmup: ensure JIT / import paths are hot before measuring.
+          for _ in range(20):
+              engine.ingest(event)
+
+          times_ms = []
+          for _ in range(1000):
+              t0 = time.perf_counter()
+              engine.ingest(event)
+              times_ms.append((time.perf_counter() - t0) * 1000.0)
+
+          times_ms.sort()
+          p50 = times_ms[499]
+          p95 = times_ms[949]
+          p99 = times_ms[989]
+          print(f"Inference latency — p50={p50:.2f}ms  p95={p95:.2f}ms  p99={p99:.2f}ms")
+
+          TARGET_P99_MS = 50.0
+          assert p99 < TARGET_P99_MS, (
+              f"Latency gate failed: p99={p99:.2f}ms exceeds {TARGET_P99_MS}ms budget"
+          )
+          print("Latency gate passed.")
+          PY
 
       - name: Verify CLI startup
         run: |
@@ -109,8 +148,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[ml]"
 
-      - name: Train XGBoost artifact
-        run: python -m f1_strategy.training --backend xgboost --seeds 8 --laps 8 --rounds 24 --output models/xgboost_lap_delta.json
+      - name: Train and register XGBoost artifact
+        run: |
+          python -m f1_strategy.training \
+            --backend xgboost \
+            --seeds 8 --laps 8 --rounds 24 \
+            --artifact-root /tmp/ci-artifacts \
+            --output models/xgboost_lap_delta.json
 
       - name: Verify XGBoost serving backend
         env:
@@ -129,8 +173,33 @@ jobs:
           print(type(engine.model).__name__)
           PY
 
-      - name: Train LightGBM artifact
-        run: python -m f1_strategy.training --backend lightgbm --seeds 8 --laps 8 --rounds 24 --output models/lightgbm_lap_delta.txt
+      - name: Verify feature importance is saved alongside XGBoost model
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          from f1_strategy.engine import InferenceEngine
+
+          importance_path = Path("models/xgboost_lap_delta.json.importance.json")
+          assert importance_path.exists(), f"Feature importance file missing: {importance_path}"
+          importance = json.loads(importance_path.read_text())
+          assert isinstance(importance, dict), "Importance should be a dict"
+          assert len(importance) > 0, "Importance dict is empty"
+          print(f"Feature importance: {len(importance)} features, top: {sorted(importance, key=lambda k: -importance[k])[:3]}")
+
+          engine = InferenceEngine()
+          fi = engine.feature_importance()
+          assert isinstance(fi, dict) and len(fi) > 0, f"engine.feature_importance() returned: {fi}"
+          print("feature_importance() check passed.")
+          PY
+
+      - name: Train and register LightGBM artifact
+        run: |
+          python -m f1_strategy.training \
+            --backend lightgbm \
+            --seeds 8 --laps 8 --rounds 24 \
+            --artifact-root /tmp/ci-artifacts \
+            --output models/lightgbm_lap_delta.txt
 
       - name: Verify LightGBM serving backend
         env:
@@ -189,8 +258,13 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -e ".[catboost,online,deep]"
 
-      - name: Train CatBoost artifact
-        run: python -m f1_strategy.training --backend catboost --seeds 8 --laps 8 --rounds 24 --output models/catboost_lap_delta.cbm
+      - name: Train and register CatBoost artifact
+        run: |
+          python -m f1_strategy.training \
+            --backend catboost \
+            --seeds 8 --laps 8 --rounds 24 \
+            --artifact-root /tmp/ci-artifacts \
+            --output models/catboost_lap_delta.cbm
 
       - name: Verify CatBoost serving backend
         env:

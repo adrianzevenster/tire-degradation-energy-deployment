@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import json
+from dataclasses import replace as _replace
 from pathlib import Path
 
 from f1_strategy.artifacts import DEFAULT_ARTIFACT_ROOT, create_model_artifact_bundle
@@ -22,6 +23,7 @@ from f1_strategy.models import (
 )
 from f1_strategy.replay import (
     DEFAULT_REPLAY_DATASET,
+    replay_reference_lap_time_s,
     run_benchmark_replay_suite,
     run_replay_evaluation,
 )
@@ -64,6 +66,78 @@ def build_parser() -> argparse.ArgumentParser:
         help="Log training metrics to MLflow (requires pip install mlflow).",
     )
     return parser
+
+
+_REQUIRED_CSV_COLUMNS = {
+    "session_id", "car_id", "lap", "sector",
+    "speed_kph", "throttle", "brake", "compound",
+    "tire_temp_fl", "tire_temp_fr", "tire_temp_rl", "tire_temp_rr",
+    "ers_soc", "fuel_kg", "track_temp_c",
+}
+
+_COLUMN_RANGES: dict[str, tuple[float, float]] = {
+    "throttle": (0.0, 1.0),
+    "brake": (0.0, 1.0),
+    "ers_soc": (0.0, 1.0),
+    "lateral_g": (0.0, 10.0),
+    "speed_kph": (0.0, 400.0),
+    "tire_temp_fl": (0.0, 250.0),
+    "tire_temp_fr": (0.0, 250.0),
+    "tire_temp_rl": (0.0, 250.0),
+    "tire_temp_rr": (0.0, 250.0),
+    "track_temp_c": (-10.0, 80.0),
+    "fuel_kg": (0.0, 200.0),
+}
+
+
+def _validate_csv_schema(records: list[dict], path: str) -> None:
+    """Raise ValueError with a diagnostic message if data quality checks fail.
+
+    Validates:
+    - All required columns are present in the header.
+    - Key numeric columns are within plausible physical ranges.
+    - Missing-value rate for required columns is below 50%.
+    """
+    if not records:
+        return
+    header = set(records[0].keys())
+    missing_cols = _REQUIRED_CSV_COLUMNS - header
+    if missing_cols:
+        raise ValueError(
+            f"Data quality failure in {path}: missing required columns {sorted(missing_cols)}"
+        )
+
+    n = len(records)
+    for col, (lo, hi) in _COLUMN_RANGES.items():
+        if col not in header:
+            continue
+        violations = []
+        blank = 0
+        for row in records:
+            v = row.get(col, "")
+            if v in ("", None, "None", "null", "nan", "NaN"):
+                blank += 1
+                continue
+            try:
+                fv = float(v)
+            except (ValueError, TypeError):
+                blank += 1
+                continue
+            if not (lo <= fv <= hi):
+                violations.append(fv)
+
+        blank_rate = blank / n
+        if blank_rate > 0.50:
+            raise ValueError(
+                f"Data quality failure in {path}: column '{col}' has {blank_rate:.0%} "
+                f"missing values (threshold 50%)"
+            )
+        if len(violations) > 0.05 * n:
+            raise ValueError(
+                f"Data quality failure in {path}: column '{col}' has "
+                f"{len(violations)} rows outside [{lo}, {hi}] "
+                f"(>{5:.0f}% of {n} records). Sample: {violations[:3]}"
+            )
 
 
 def _coerce_csv_row(row: dict) -> dict:
@@ -153,6 +227,7 @@ def _real_data_rows(
         with p.open(encoding="utf-8", newline="") as fh:
             records = list(csv.DictReader(fh))
 
+    _validate_csv_schema(records, path)
     lo, hi = _lap_time_bounds(records)
 
     # First pass: collect outlier-filtered records for auto-base computation.
@@ -354,10 +429,17 @@ def train_xgboost_model(
         feature_schema_hash=feature_schema_hash(),
         training_rows=str(len(rows)),
     )
+    _mlflow_log_metrics(
+        use_mlflow, rows, targets,
+        lambda row: booster.predict(xgb.DMatrix([row], feature_names=FEATURE_NAMES))[0],
+    )
+    importance = _compute_feature_importance(booster, "xgboost")
+    _mlflow_log_feature_importance(use_mlflow, importance)
 
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(output_path))
+    _save_feature_importance(output_path, importance)
     write_model_manifest(output_path, backend="xgboost", training_rows=len(rows))
     _mlflow_log_artifact(use_mlflow, output_path)
     return output_path
@@ -400,10 +482,17 @@ def train_lightgbm_model(
         feature_name=FEATURE_NAMES,
     )
     booster = lgb.train(params=params, train_set=dataset, num_boost_round=rounds)
+    _mlflow_log_metrics(
+        use_mlflow, rows, targets,
+        lambda row: float(booster.predict([row])[0]),
+    )
+    importance = _compute_feature_importance(booster, "lightgbm")
+    _mlflow_log_feature_importance(use_mlflow, importance)
 
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     booster.save_model(str(output_path))
+    _save_feature_importance(output_path, importance)
     write_model_manifest(output_path, backend="lightgbm", training_rows=len(rows))
     _mlflow_log_artifact(use_mlflow, output_path)
     return output_path
@@ -435,10 +524,17 @@ def train_catboost_model(
     _mlflow_start(use_mlflow, "catboost", catboost_params, len(rows), real_data_paths)
     model = CatBoostRegressor(**catboost_params)
     model.fit(Pool(rows, targets, feature_names=FEATURE_NAMES))
+    _mlflow_log_metrics(
+        use_mlflow, rows, targets,
+        lambda row: float(model.predict([row])[0]),
+    )
+    importance = _compute_feature_importance(model, "catboost")
+    _mlflow_log_feature_importance(use_mlflow, importance)
 
     output_path = Path(output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     model.save_model(str(output_path))
+    _save_feature_importance(output_path, importance)
     write_model_manifest(output_path, backend="catboost", training_rows=len(rows))
     _mlflow_log_artifact(use_mlflow, output_path)
     return output_path
@@ -539,10 +635,13 @@ def _mlflow_start(
         tracking_uri = load_settings().mlflow_tracking_uri
         if tracking_uri:
             mlflow.set_tracking_uri(tracking_uri)
+        experiment_name = f"f1-tire-energy-{backend}"
+        mlflow.set_experiment(experiment_name)
         mlflow.start_run()
         mlflow.log_param("backend", backend)
         mlflow.log_param("training_rows", training_rows)
         mlflow.log_param("real_data_paths", ",".join(real_data_paths) if real_data_paths else "synthetic")
+        mlflow.log_param("feature_schema_version", "online-features-v5")
         for k, v in params.items():
             mlflow.log_param(k, v)
     except ImportError:
@@ -551,12 +650,78 @@ def _mlflow_start(
         print(f"MLflow logging failed: {exc}")
 
 
+def _mlflow_log_metrics(
+    enabled: bool,
+    rows: list[list[float]],
+    targets: list[float],
+    predict_fn: object,
+) -> None:
+    """Compute and log training-set RMSE and MAE to the active MLflow run."""
+    if not enabled:
+        return
+    try:
+        import mlflow
+        import math
+
+        preds = [predict_fn(row) for row in rows]  # type: ignore[operator]
+        n = len(targets)
+        rmse = math.sqrt(sum((p - t) ** 2 for p, t in zip(preds, targets)) / max(n, 1))
+        mae = sum(abs(p - t) for p, t in zip(preds, targets)) / max(n, 1)
+        mlflow.log_metric("train_rmse_lap_delta_s", rmse)
+        mlflow.log_metric("train_mae_lap_delta_s", mae)
+    except Exception:
+        pass
+
+
+def _compute_feature_importance(model: object, backend: str) -> dict[str, float]:
+    """Return {feature_name: gain_score} from the trained booster."""
+    try:
+        if backend == "xgboost":
+            raw = model.get_score(importance_type="gain")  # type: ignore[union-attr]
+            return {k: float(v) for k, v in raw.items()}
+        if backend == "lightgbm":
+            scores = model.feature_importance(importance_type="gain")  # type: ignore[union-attr]
+            names = model.feature_name()  # type: ignore[union-attr]
+            return {name: float(score) for name, score in zip(names, scores)}
+        if backend == "catboost":
+            scores = model.get_feature_importance()  # type: ignore[union-attr]
+            names = model.feature_names_  # type: ignore[union-attr]
+            return {name: float(score) for name, score in zip(names, scores)}
+    except Exception:
+        pass
+    return {}
+
+
+def _save_feature_importance(output_path: Path, importance: dict[str, float]) -> None:
+    if not importance:
+        return
+    importance_path = output_path.with_name(output_path.name + ".importance.json")
+    importance_path.write_text(
+        json.dumps(importance, sort_keys=True, indent=2), encoding="utf-8"
+    )
+
+
+def _mlflow_log_feature_importance(enabled: bool, importance: dict[str, float]) -> None:
+    if not enabled or not importance:
+        return
+    try:
+        import mlflow
+        total = sum(importance.values()) or 1.0
+        for name, score in sorted(importance.items(), key=lambda x: -x[1])[:30]:
+            mlflow.log_metric(f"fi_{name}", round(score / total, 6))
+    except Exception:
+        pass
+
+
 def _mlflow_log_artifact(enabled: bool, path: Path) -> None:
     if not enabled:
         return
     try:
         import mlflow
         mlflow.log_artifact(str(path))
+        importance_path = path.with_name(path.name + ".importance.json")
+        if importance_path.exists():
+            mlflow.log_artifact(str(importance_path))
         mlflow.end_run()
     except Exception:
         pass
@@ -583,18 +748,40 @@ def main() -> None:
             seeds=args.seeds,
             rounds=args.rounds,
             real_data_paths=args.real_data or None,
+            replay_dataset_path=args.replay_dataset,
         )
         report = run_evaluation(
             model_backend=args.backend,
             model_paths={args.backend: str(output_path), "sequence": str(output_path)},
         )
+        _backend = args.backend
+        _output = str(output_path)
+        _replay_base = replay_reference_lap_time_s(args.replay_dataset)
         replay_report = run_replay_evaluation(
             args.replay_dataset,
-            engine=InferenceEngine(model=_serving_model_for_artifact(args.backend, output_path)),
+            engine=InferenceEngine(
+                model=create_serving_model(
+                    config=ModelConfig(base_lap_time_s=_replay_base),
+                    backend=_backend,
+                    xgboost_model_path=_output if _backend == "xgboost" else "models/xgboost_lap_delta.json",
+                    lightgbm_model_path=_output if _backend == "lightgbm" else "models/lightgbm_lap_delta.txt",
+                    catboost_model_path=_output if _backend == "catboost" else "models/catboost_lap_delta.cbm",
+                    sequence_model_path=_output if _backend == "sequence" else "models/sequence_lap_delta.pt",
+                ),
+                settings=_replace(load_settings(), base_lap_time_s=_replay_base),
+            ),
         )
         replay_suite = run_benchmark_replay_suite(
-            engine_factory=lambda: InferenceEngine(
-                model=_serving_model_for_artifact(args.backend, output_path)
+            engine_factory=lambda base: InferenceEngine(
+                model=create_serving_model(
+                    config=ModelConfig(base_lap_time_s=base),
+                    backend=_backend,
+                    xgboost_model_path=_output if _backend == "xgboost" else "models/xgboost_lap_delta.json",
+                    lightgbm_model_path=_output if _backend == "lightgbm" else "models/lightgbm_lap_delta.txt",
+                    catboost_model_path=_output if _backend == "catboost" else "models/catboost_lap_delta.cbm",
+                    sequence_model_path=_output if _backend == "sequence" else "models/sequence_lap_delta.pt",
+                ),
+                settings=_replace(load_settings(), base_lap_time_s=base),
             )
         )
         bundle = create_model_artifact_bundle(
@@ -605,6 +792,7 @@ def main() -> None:
             replay_evaluation_report=replay_report,
             replay_suite_report=replay_suite,
             artifact_root=args.artifact_root or DEFAULT_ARTIFACT_ROOT,
+            replay_dataset=args.replay_dataset,
         )
         print(f"bundled artifact: {bundle.artifact_id}")
         print(f"registry: {bundle.registry_path}")
@@ -617,6 +805,7 @@ def _training_config(
     seeds: int,
     rounds: int,
     real_data_paths: list[str] | None = None,
+    replay_dataset_path: str | None = None,
 ) -> dict[str, object]:
     training_rows = None
     manifest_path = model_manifest_path(output_path)
@@ -631,6 +820,7 @@ def _training_config(
         "rounds": rounds,
         "training_rows": training_rows,
         "real_data_paths": real_data_paths,
+        "replay_dataset_path": replay_dataset_path,
         "feature_schema_hash": feature_schema_hash(),
     }
 

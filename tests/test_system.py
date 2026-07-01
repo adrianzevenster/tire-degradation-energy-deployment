@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import csv
 import json
 import os
 import unittest
 from datetime import timedelta
+from html.parser import HTMLParser
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
@@ -371,6 +373,25 @@ class SystemTest(unittest.TestCase):
         self.assertTrue(all(isinstance(value, bool) for value in report.gates.values()))
         self.assertTrue(report.passed, payload)
 
+    def test_replay_evaluation_accepts_openf1_tire_age_column(self) -> None:
+        events = load_replay_events("examples/replay_telemetry.csv")
+        sample = to_jsonable(events[0])
+        with TemporaryDirectory() as tmpdir:
+            dataset_path = Path(tmpdir) / "openf1-replay.csv"
+            fieldnames = list(REPLAY_REQUIRED_COLUMNS) + ["lap_time_s", "timestamp_ms", "circuit", "actual_tire_age_laps"]
+            with dataset_path.open("w", encoding="utf-8", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerow({**sample, "actual_tire_age_laps": 11})
+
+            loaded = load_replay_events(dataset_path)
+            self.assertEqual(len(loaded), 1)
+            self.assertEqual(loaded[0].session_id, sample["session_id"])
+
+            report = run_replay_evaluation(dataset_path)
+            self.assertEqual(report.event_count, 1)
+            self.assertEqual(report.labeled_event_count, 1)
+
     def test_fastf1_export_maps_observed_and_derived_replay_fields(self) -> None:
         session = FakeFastF1Session()
         rows = rows_from_fastf1_session(
@@ -519,16 +540,48 @@ class SystemTest(unittest.TestCase):
         self.assertIn("mergeExternalServices", app_js)
         self.assertIn("runReplayCheck", app_js)
         self.assertIn("runRegressionCheck", app_js)
-        self.assertIn("window.location.hostname", app_js)
+        self.assertIn("runSmokeCheck", app_js)
+        self.assertNotIn("window.location.hostname", app_js)
         self.assertIn("externalLinksRow", index_html)
+        self.assertIn("Evaluation", index_html)
+        self.assertIn("Promotion", index_html)
+        self.assertIn("Training", index_html)
         self.assertIn("Run Checks", index_html)
         self.assertIn("Replay Run", index_html)
         self.assertIn("Regression Run", index_html)
+        self.assertIn("Run Deployment Smoke", index_html)
+        self.assertIn("trainingReplayDatasetSelect", index_html)
         self.assertIn("Auto (serving)", index_html)
+        self.assertIn("comparisonSummary", index_html)
+        self.assertIn("comparisonModelValue", index_html)
+        self.assertIn("comparisonVerdictValue", index_html)
+        self.assertIn("comparisonActionValue", index_html)
+        self.assertIn("Action", index_html)
         self.assertNotIn('href="http://localhost:5000"', index_html)
         self.assertNotIn('href="http://localhost:3000"', index_html)
         self.assertNotIn('href="http://localhost:9090"', index_html)
+        self.assertIn("replay_dataset_path", app_js)
         self.assertIn(".ext-link.disabled", styles)
+
+    def test_ui_tab_sections_are_balanced(self) -> None:
+        index_html = Path("src/f1_strategy/ui/index.html").read_text(encoding="utf-8")
+
+        class SectionBalanceParser(HTMLParser):
+            def __init__(self) -> None:
+                super().__init__()
+                self.unclosed: list[tuple[int, int]] = []
+
+            def handle_starttag(self, tag: str, attrs) -> None:
+                if tag == "section":
+                    self.unclosed.append(self.getpos())
+
+            def handle_endtag(self, tag: str) -> None:
+                if tag == "section" and self.unclosed:
+                    self.unclosed.pop()
+
+        parser = SectionBalanceParser()
+        parser.feed(index_html)
+        self.assertFalse(parser.unclosed, f"Unclosed section tags at: {parser.unclosed}")
 
     def test_replay_suite_default_engine_ignores_serving_artifact_environment(self) -> None:
         created_settings = []

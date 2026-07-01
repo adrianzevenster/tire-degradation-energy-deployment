@@ -39,6 +39,9 @@ class ApiTest(unittest.TestCase):
         self.assertIn("/evaluation/replay-benchmark", paths)
         self.assertIn("/evaluation/replay/run", paths)
         self.assertIn("/regression/run", paths)
+        self.assertIn("/deployment/smoke", paths)
+        self.assertIn("/ops/run-checks", paths)
+        self.assertIn("/ops", paths)
         self.assertIn("/data-sources/replay-datasets", paths)
         self.assertIn("/data-sources/replay-datasets/{dataset_path:path}/manifest", paths)
         self.assertIn("/integrations/external-links", paths)
@@ -58,6 +61,11 @@ class ApiTest(unittest.TestCase):
     def test_model_backend_can_switch_to_dependency_light_model(self) -> None:
         models = self.api.models()
         self.assertIn("kalman", models["available_backends"])
+        self.assertIn("backend_catalog", models)
+        self.assertIn("trainable_backends", models)
+        self.assertIn("serving_backends", models)
+        self.assertIn("xgboost", models["trainable_backends"])
+        self.assertIn("auto", models["serving_backends"])
 
         switched = self.api.model_backend("kalman")
         self.assertEqual(switched["configured_backend"], "kalman")
@@ -111,11 +119,61 @@ class ApiTest(unittest.TestCase):
         regression = self.api.regression_run(
             self.api.RegressionRunRequest(laps=12, seed=7, min_calibration_width_s=0.2)
         )
+        smoke = self.api.deployment_smoke(self.api.SmokeRunRequest(probe_external_links=False))
+        ops = self.api.ops()
 
         self.assertEqual(replay["kind"], "dataset")
         self.assertIn("report", replay)
         self.assertTrue(regression["results"])
         self.assertIn("passed", regression)
+        self.assertIn("checks", smoke)
+        self.assertIn("replay", smoke)
+        self.assertIn("run_checks", ops)
+
+    def test_training_request_includes_replay_dataset_and_jobs_payload(self) -> None:
+        request = self.api.TrainingRequest(
+            backend="xgboost",
+            replay_dataset_path="examples/replay_telemetry.csv",
+        )
+        self.assertEqual(request.replay_dataset_path, "examples/replay_telemetry.csv")
+        original_jobs = dict(self.api._training_jobs)
+        try:
+            self.api._training_jobs["job-1"] = {
+                "status": "done",
+                "backend": "xgboost",
+                "started_at": 1.0,
+                "completed_at": 2.0,
+                "artifact_id": "xgboost/demo",
+                "replay_dataset_path": "examples/replay_telemetry.csv",
+                "log": ["done"],
+            }
+            payload = self.api.training_jobs_list()
+            job = payload["jobs"][0]
+            self.assertEqual(job["replay_dataset_path"], "examples/replay_telemetry.csv")
+        finally:
+            self.api._training_jobs.clear()
+            self.api._training_jobs.update(original_jobs)
+
+    def test_model_comparison_includes_deployment_recommendations(self) -> None:
+        from f1_strategy.engine import InferenceEngine
+        from f1_strategy.monitoring import MonitoringService
+        from f1_strategy.simulation import RaceSimulator, SimulationConfig
+
+        monitoring = MonitoringService()
+        hybrid = InferenceEngine(monitoring=monitoring)
+        kalman = InferenceEngine(
+            monitoring=monitoring,
+            settings=hybrid.settings.__class__(model_backend="kalman"),
+        )
+        for engine, seed in ((hybrid, 21), (kalman, 22)):
+            for event in RaceSimulator(SimulationConfig(laps=1, seed=seed)).events():
+                engine.ingest(event)
+
+        rows = hybrid.model_comparison()
+
+        self.assertTrue(rows)
+        self.assertIn("recommendation", rows[0])
+        self.assertIn(rows[0]["recommendation"]["action"], {"promote", "hold", "retire"})
 
     def test_external_links_api_exposes_configured_and_internal_services(self) -> None:
         payload = self.api.external_links()

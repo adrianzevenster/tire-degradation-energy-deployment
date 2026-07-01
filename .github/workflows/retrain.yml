@@ -1,0 +1,138 @@
+name: Retrain
+
+on:
+  workflow_dispatch:
+    inputs:
+      backend:
+        description: Model backend to train
+        default: xgboost
+        type: choice
+        options: [xgboost, lightgbm, catboost]
+      seeds:
+        description: Number of random seeds
+        default: "128"
+        type: string
+      rounds:
+        description: Boosting rounds
+        default: "200"
+        type: string
+  schedule:
+    # Weekly retrain — Monday 02:00 UTC
+    - cron: "0 2 * * 1"
+
+concurrency:
+  group: retrain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  retrain:
+    name: DVC retrain + promote
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          # Full history so git describe / sha work in artifact IDs
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install dvc dvc-s3
+          pip install -e ".[ml]"
+
+      # Override params from workflow_dispatch inputs when manually triggered
+      - name: Override params from inputs
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          python - <<'EOF'
+          import yaml, sys
+          with open("params.yaml") as f:
+              p = yaml.safe_load(f)
+          p["train"]["backend"] = "${{ inputs.backend }}"
+          p["train"]["seeds"]   = int("${{ inputs.seeds }}")
+          p["train"]["rounds"]  = int("${{ inputs.rounds }}")
+          with open("params.yaml", "w") as f:
+              yaml.dump(p, f, default_flow_style=False)
+          print("params.yaml updated:", p["train"])
+          EOF
+
+      # Configure DVC remote.  Set DVC_REMOTE_URL in repo secrets to point at
+      # an S3 bucket (s3://bucket/prefix) or GCS (gs://bucket/prefix).
+      # Falls back to a local path if the secret is not set (no data pull).
+      - name: Configure DVC remote
+        env:
+          DVC_REMOTE_URL: ${{ secrets.DVC_REMOTE_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -n "$DVC_REMOTE_URL" ]; then
+            dvc remote modify origin url "$DVC_REMOTE_URL"
+            echo "DVC remote configured: $DVC_REMOTE_URL"
+          else
+            echo "No DVC_REMOTE_URL secret — skipping remote configuration"
+          fi
+
+      - name: Pull training data from DVC remote
+        env:
+          DVC_REMOTE_URL: ${{ secrets.DVC_REMOTE_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -n "$DVC_REMOTE_URL" ]; then
+            dvc pull data.dvc
+          else
+            echo "Skipping dvc pull (no remote configured)"
+            # Verify data is present some other way
+            if [ ! -d data ] || [ -z "$(ls data/fastf1-*.csv 2>/dev/null)" ]; then
+              echo "ERROR: data/ directory is missing and no DVC remote is configured."
+              echo "Either set DVC_REMOTE_URL as a repository secret, or push data manually."
+              exit 1
+            fi
+          fi
+
+      - name: Reproduce pipeline (skip if nothing changed)
+        run: dvc repro --pull
+
+      - name: Show pipeline metrics
+        run: dvc metrics show || true
+
+      - name: Show changed metrics vs previous run
+        run: dvc metrics diff || true
+
+      - name: Promote latest candidate artifact
+        run: |
+          python -m f1_strategy.artifacts promote-latest \
+            --backend ${{ inputs.backend || 'xgboost' }} \
+            --artifact-root artifacts/models
+
+      - name: Push model outputs to DVC remote
+        env:
+          DVC_REMOTE_URL: ${{ secrets.DVC_REMOTE_URL }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        run: |
+          if [ -n "$DVC_REMOTE_URL" ]; then
+            dvc push
+          fi
+
+      - name: Commit dvc.lock, registry, and model back to repo
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dvc.lock params.yaml artifacts/models/registry.json models/ || true
+          if git diff --staged --quiet; then
+            echo "Nothing changed — skipping commit."
+          else
+            git commit -m "chore: retrain ${{ inputs.backend || 'xgboost' }} [skip ci]"
+            git push
+          fi

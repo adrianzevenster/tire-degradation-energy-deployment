@@ -1,0 +1,70 @@
+schema: '2.0'
+stages:
+  train:
+    cmd: python -m f1_strategy.training --backend xgboost --seeds 128 --rounds 
+      200 --artifact-root artifacts/models --replay-dataset 
+      examples/replay_telemetry.csv --real-data 
+      data/fastf1-2023-bahrain-r-VER.csv data/fastf1-2023-monaco-r-VER.csv 
+      data/fastf1-2023-monza-r-VER.csv data/fastf1-2023-silverstone-r-VER.csv 
+      data/fastf1-2023-singapore-r-VER.csv data/fastf1-2024-bahrain-r-HAM.csv 
+      data/fastf1-2024-bahrain-r-LEC.csv data/fastf1-2024-bahrain-r-NOR.csv 
+      data/fastf1-2024-bahrain-r-ver.csv data/fastf1-2024-monaco-r-HAM.csv 
+      data/fastf1-2024-monaco-r-LEC.csv data/fastf1-2024-monaco-r-NOR.csv 
+      data/fastf1-2024-monaco-r-ver.csv data/fastf1-2024-monza-r-HAM.csv 
+      data/fastf1-2024-monza-r-LEC.csv data/fastf1-2024-monza-r-NOR.csv 
+      data/fastf1-2024-monza-r-ver.csv data/fastf1-2024-multi-r-ver.csv 
+      data/fastf1-2024-silverstone-r-HAM.csv 
+      data/fastf1-2024-silverstone-r-LEC.csv 
+      data/fastf1-2024-silverstone-r-NOR.csv 
+      data/fastf1-2024-silverstone-r-ver.csv 
+      data/fastf1-2024-singapore-r-HAM.csv data/fastf1-2024-singapore-r-LEC.csv 
+      data/fastf1-2024-singapore-r-NOR.csv data/fastf1-2024-singapore-r-ver.csv
+    deps:
+    - path: data/
+      hash: md5
+      md5: 1036cf64431d7287aed5f6aeeacb6867.dir
+      size: 4096629706
+      nfiles: 514
+    - path: examples/replay_benchmarks/
+      hash: md5
+      md5: ed826eb2571325571809752698fccc9b.dir
+      size: 109303
+      nfiles: 11
+    - path: examples/replay_telemetry.csv
+      hash: md5
+      md5: 4169dc96a9347349049d045734045303
+      size: 4521
+    - path: src/f1_strategy/
+      hash: md5
+      md5: 0e5c2fdf6de9bf2af7d0bf442af485f0.dir
+      size: 1045352
+      nfiles: 61
+    params:
+      params.yaml:
+        train.artifact_root: artifacts/models
+        train.backend: xgboost
+        train.replay_dataset: examples/replay_telemetry.csv
+        train.rounds: 200
+        train.seeds: 128
+    outs:
+    - path: models/xgboost_lap_delta.json
+      hash: md5
+      md5: 5785bff4b9aa8f8ebc291e9be251a9f5
+      size: 334158
+  promote:
+    cmd: python -m f1_strategy.artifacts promote-latest --backend xgboost 
+      --artifact-root artifacts/models
+    deps:
+    - path: models/xgboost_lap_delta.json
+      hash: md5
+      md5: 5785bff4b9aa8f8ebc291e9be251a9f5
+      size: 334158
+    params:
+      params.yaml:
+        train.artifact_root: artifacts/models
+        train.backend: xgboost
+    outs:
+    - path: artifacts/models/registry.json
+      hash: md5
+      md5: 69a82b1b6ae7b96f3d583ce878e44e19
+      size: 978

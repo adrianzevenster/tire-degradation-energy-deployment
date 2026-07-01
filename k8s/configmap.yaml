@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: f1-strategy-config
+  namespace: f1-strategy
+data:
+  F1_ENV: "production"
+  F1_LOG_LEVEL: "INFO"
+  F1_API_HOST: "0.0.0.0"
+  F1_API_PORT: "8000"
+  F1_MODEL_BACKEND: "auto"
+  F1_FEATURE_WINDOW_SIZE: "50"
+  F1_PROMETHEUS_ENABLED: "true"
+  F1_PERSISTENCE_BACKEND: "duckdb"
+  F1_DUCKDB_PATH: "/data/f1_strategy.duckdb"
+  F1_MODEL_ARTIFACT_ROOT: "/artifacts/models"
+  F1_FEATURE_STORE_BACKEND: "redis"

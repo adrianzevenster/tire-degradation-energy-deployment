@@ -16,7 +16,7 @@ WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
 
-RUN pip install --no-cache-dir -e ".[api,observability,persistence]"
+RUN pip install --no-cache-dir -e ".[api,observability,persistence,ml]"
 
 EXPOSE 8000
 CMD ["uvicorn", "f1_strategy.api:app", "--host", "0.0.0.0", "--port", "8000"]

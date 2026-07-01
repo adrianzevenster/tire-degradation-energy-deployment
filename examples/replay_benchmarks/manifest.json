@@ -1,0 +1,66 @@
+{
+  "datasets": [
+    {
+      "base_lap_time_s": 90.0,
+      "compound": "medium",
+      "description": "stable medium tire long-run replay",
+      "events": 54,
+      "fingerprint": "fad10884e516cfa339dc1000592051e581c2b8d2c09f49eb89ad3649f0758c77",
+      "labeled_events": 54,
+      "laps": 18,
+      "name": "medium-long-run",
+      "path": "examples/replay_benchmarks/medium_long_run.csv",
+      "session_id": "benchmark-medium-long-run"
+    },
+    {
+      "base_lap_time_s": 90.0,
+      "compound": "soft",
+      "description": "soft tire stint with elevated track and tire temperatures",
+      "events": 42,
+      "fingerprint": "4974d5b7bc75c354f2228021624fe3203336096bad7d3dd1bae613a41de11f92",
+      "labeled_events": 42,
+      "laps": 14,
+      "name": "soft-hot-track",
+      "path": "examples/replay_benchmarks/soft_hot_track.csv",
+      "session_id": "benchmark-soft-hot-track"
+    },
+    {
+      "base_lap_time_s": 90.0,
+      "compound": "hard",
+      "description": "hard tire long stint emphasizing fuel-burn pace evolution",
+      "events": 66,
+      "fingerprint": "410f1449537c12385860ca0547290342996b940941ab85b3a019fd0f4ca8929b",
+      "labeled_events": 66,
+      "laps": 22,
+      "name": "hard-fuel-burn",
+      "path": "examples/replay_benchmarks/hard_fuel_burn.csv",
+      "session_id": "benchmark-hard-fuel-burn"
+    },
+    {
+      "base_lap_time_s": 91.8,
+      "compound": "intermediate",
+      "description": "intermediate tire wet-track pace replay",
+      "events": 42,
+      "fingerprint": "bdfb9eb50a0491296441be686afe1c7dced198e1ce8c100d4571ce7bcc5aa6ad",
+      "labeled_events": 42,
+      "laps": 14,
+      "name": "intermediate-wet-track",
+      "path": "examples/replay_benchmarks/intermediate_wet_track.csv",
+      "session_id": "benchmark-intermediate-wet-track"
+    },
+    {
+      "base_lap_time_s": 90.0,
+      "compound": "medium",
+      "description": "traffic replay with dirty-air thermal and pace penalties",
+      "events": 42,
+      "fingerprint": "77c90b98b60930b0cd856026a9c845173e6e9b2ff5b0aa0a871854905acc8b46",
+      "labeled_events": 42,
+      "laps": 14,
+      "name": "dirty-air-traffic",
+      "path": "examples/replay_benchmarks/dirty_air_traffic.csv",
+      "session_id": "benchmark-dirty-air-traffic"
+    }
+  ],
+  "description": "Deterministic benchmark replay fixtures for slice-level promotion gates.",
+  "version": 1
+}

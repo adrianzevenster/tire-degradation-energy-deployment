@@ -1,0 +1,116 @@
+# Production overlay — apply with:
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d
+#
+# Creates named volumes so data survives container recreation.
+# Binds 0.0.0.0 only on the nginx port; internal services are not host-exposed.
+
+services:
+  redis:
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    ports: []  # not exposed externally; accessed via internal network
+
+  mlflow:
+    restart: unless-stopped
+    volumes:
+      - mlruns-data:/mlruns
+    ports: []  # served through nginx
+    deploy:
+      resources:
+        limits:
+          memory: 512m
+
+  api:
+    restart: unless-stopped
+    build:
+      context: .
+      args:
+        F1_BUILD_SHA: ${F1_BUILD_SHA:-unknown}
+        F1_BUILD_DATE: ${F1_BUILD_DATE:-unknown}
+    env_file:
+      - .env.production
+    environment:
+      F1_ENV: production
+      F1_REDIS_URL: redis://redis:6379/0
+      F1_FEATURE_STORE_BACKEND: auto
+      F1_MLFLOW_TRACKING_URI: http://mlflow:5000
+      F1_PERSISTENCE_BACKEND: duckdb
+      F1_DUCKDB_PATH: /data/f1_strategy.duckdb
+      F1_MODEL_ARTIFACT_ROOT: /artifacts/models
+    volumes:
+      - artifacts-data:/artifacts
+      - duckdb-data:/data
+    ports: []  # served through nginx
+    deploy:
+      resources:
+        limits:
+          memory: 2g
+          cpus: "1.0"
+
+  prometheus:
+    restart: unless-stopped
+    volumes:
+      - prometheus-data:/prometheus
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/rules:/etc/prometheus/rules:ro
+    ports: []
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  alertmanager:
+    restart: unless-stopped
+    volumes:
+      - alertmanager-data:/alertmanager
+      - ./monitoring/alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    ports: []
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+
+  grafana:
+    restart: unless-stopped
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports: []
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GF_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GF_ADMIN_PASSWORD:?GF_ADMIN_PASSWORD is required}
+      GF_SERVER_ROOT_URL: ${GF_ROOT_URL:-http://localhost/grafana}
+      GF_SERVER_SERVE_FROM_SUB_PATH: "true"
+    deploy:
+      resources:
+        limits:
+          memory: 256m
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./monitoring/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./monitoring/nginx/certs:/etc/nginx/certs:ro
+    depends_on:
+      - api
+      - grafana
+      - mlflow
+    deploy:
+      resources:
+        limits:
+          memory: 64m
+
+volumes:
+  redis-data:
+  mlruns-data:
+  artifacts-data:
+  duckdb-data:
+  prometheus-data:
+  grafana-data:
+  alertmanager-data:

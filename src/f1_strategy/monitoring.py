@@ -29,6 +29,7 @@ ML_METRICS = [
 INFRA_METRICS = [
     "inference_latency_ms",
     "throughput_events_total",
+    "predictions_total",
     "queue_depth",
     "drift_alerts_total",
     "deployment_ready",
@@ -132,6 +133,7 @@ class MonitoringService:
         elapsed = max(now - self._last_event_at, 1e-9)
         self._last_event_at = now
         self.store.inc("throughput_events_total")
+        self.store.inc("predictions_total")
         self.store.set("throughput_events_per_second", 1.0 / elapsed)
         self.store.observe("inference_latency_ms", latency_ms)
         self.store.set("tire_wear_pct", prediction.tire_wear_pct)
@@ -255,6 +257,9 @@ class MonitoringService:
         )
         for rank, row in enumerate(rows, start=1):
             row["rank"] = rank
+        best_row = rows[0] if rows else None
+        for row in rows:
+            row["recommendation"] = _comparison_recommendation(row, best_row)
         return rows
 
     def model_alerts(
@@ -413,6 +418,42 @@ def _performance_summary(
                 if sample.ending_soc_error is not None
             )
         ),
+    }
+
+
+def _comparison_recommendation(row: dict, best_row: dict | None) -> dict[str, str | float]:
+    best_mae = float(best_row["mae_lap_delta_s"]) if best_row else float(row["mae_lap_delta_s"])
+    mae = float(row["mae_lap_delta_s"])
+    coverage = float(row["interval_coverage_pct"])
+    health = float(row["health_score"])
+    alert_count = int(row["alert_count"])
+    critical_count = int(row["critical_alert_count"])
+    mae_gap = mae - best_mae
+
+    if (
+        critical_count > 0
+        or health < 55.0
+        or coverage < 75.0
+        or mae_gap > 0.08
+    ):
+        action = "retire"
+        reason = "High error, weak coverage, or critical alerts"
+    elif row.get("rank") == 1 and health >= 80.0 and coverage >= 90.0 and alert_count == 0:
+        action = "promote"
+        reason = "Best observed performer with strong coverage and no alerts"
+    elif mae_gap <= 0.03 and health >= 70.0 and coverage >= 85.0 and critical_count == 0:
+        action = "hold"
+        reason = "Competitive but not clearly ahead of the field"
+    else:
+        action = "hold"
+        reason = "Needs more evidence before promotion"
+
+    return {
+        "action": action,
+        "reason": reason,
+        "mae_gap_s": round(mae_gap, 6),
+        "coverage_gap_pct": round(float(best_row["interval_coverage_pct"]) - coverage, 6) if best_row else 0.0,
+        "health_score": round(health, 2),
     }
 
 

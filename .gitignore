@@ -19,9 +19,9 @@ env/
 # Local configuration
 .env
 .env.local
+.env.production
 
 # IDE/editor state
-.codex
 .idea/
 .vscode/
 *.swp
@@ -37,6 +37,12 @@ data/
 *.sqlite
 *.log
 
+# TLS certs — generate with: make certs
+monitoring/nginx/certs/*.crt
+monitoring/nginx/certs/*.key
+monitoring/nginx/certs/*.pem
+
 # OS files
 .DS_Store
 Thumbs.db
+/data

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import csv
 import json
-import math
 import time
 import unittest
 from pathlib import Path

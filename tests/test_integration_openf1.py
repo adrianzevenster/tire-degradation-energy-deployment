@@ -99,7 +99,8 @@ def test_fleet_intervals_export_pipeline():
         export_fleet_intervals,
         build_fleet_state_for_lap,
     )
-    import tempfile, os
+    import os
+    import tempfile
 
     sessions = _get("/sessions", {"year": 2024, "session_name": "Race", "circuit_short_name": "Bahrain"})
     if not sessions:

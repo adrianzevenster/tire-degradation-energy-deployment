@@ -3,7 +3,7 @@
   "generated_at": "2026-06-05T00:00:00Z",
   "description": "hard tire long stint emphasizing fuel-burn pace evolution",
   "output": "examples/replay_benchmarks/hard_fuel_burn.csv",
-  "dataset_fingerprint": "410f1449537c12385860ca0547290342996b940941ab85b3a019fd0f4ca8929b",
+  "dataset_fingerprint": "dcaaf50a4e4660a6d64205fc30baf7880fa00239a3d36f02b0bb17dd23121335",
   "row_count": 66,
   "lap_count": 22,
   "session_count": 1,

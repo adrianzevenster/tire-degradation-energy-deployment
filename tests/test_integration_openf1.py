@@ -11,9 +11,14 @@ CI suite (which only runs unit + system tests). They verify that:
 from __future__ import annotations
 
 import json
-import urllib.request
+import unittest
 import urllib.error
-import pytest
+import urllib.request
+
+try:
+    import pytest
+except ImportError:
+    raise unittest.SkipTest("pytest not installed — run: pip install pytest")
 
 
 OPENF1_BASE = "https://api.openf1.org/v1"

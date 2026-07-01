@@ -3,7 +3,7 @@
   "generated_at": "2026-06-05T00:00:00Z",
   "description": "soft tire stint with elevated track and tire temperatures",
   "output": "examples/replay_benchmarks/soft_hot_track.csv",
-  "dataset_fingerprint": "4974d5b7bc75c354f2228021624fe3203336096bad7d3dd1bae613a41de11f92",
+  "dataset_fingerprint": "cb2cb02de4fd599ab2925d36295c831495cf4d36518a5ad4b6f37f9a22277338",
   "row_count": 42,
   "lap_count": 14,
   "session_count": 1,

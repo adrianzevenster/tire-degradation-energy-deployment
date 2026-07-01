@@ -58,7 +58,10 @@ fi
 info ".env.production validated."
 
 # ── 4. Build and start ────────────────────────────────────────────────────────
-COMPOSE_CMD="docker compose -f docker-compose.yml -f docker-compose.prod.yml"
+# Export env vars so docker compose interpolates ${VAR} in the prod overlay.
+set -a; source "${ENV_FILE}"; set +a
+
+COMPOSE_CMD="docker compose --env-file ${ENV_FILE} -f docker-compose.yml -f docker-compose.prod.yml"
 
 info "Pulling latest images..."
 ${COMPOSE_CMD} pull --ignore-pull-failures 2>/dev/null || true

@@ -402,8 +402,7 @@ async function changeModelArtifact() {
 }
 
 async function refreshMetrics() {
-  const text = await api("/metrics");
-  state.metrics = parseMetrics(text);
+  state.metrics = await api("/monitoring/metrics-summary");
   state.metricHistory.push({
     latency: state.metrics.f1_inference_latency_ms_p95,
     throughput: state.metrics.f1_throughput_events_total,

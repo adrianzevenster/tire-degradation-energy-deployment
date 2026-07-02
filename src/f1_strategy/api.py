@@ -673,6 +673,10 @@ try:
     def monitoring_alerts() -> dict:
         return engine.model_alerts()
 
+    @app.get("/monitoring/metrics-summary")
+    def monitoring_metrics_summary() -> dict[str, float]:
+        return engine.monitoring.key_metrics()
+
     @app.get("/deployment/readiness")
     def deployment_readiness(mode: str = "local") -> dict:
         if mode not in {"local", "production"}:

@@ -220,6 +220,20 @@ class MonitoringService:
     def render_prometheus(self) -> str:
         return self.store.render_prometheus()
 
+    def key_metrics(self) -> dict[str, float]:
+        """Return the UI-relevant metrics as a flat dict keyed by Prometheus name."""
+        store = self.store
+        result: dict[str, float] = {}
+        for name, value in store.counters.items():
+            result[f"f1_{name}"] = value
+        for name, value in store.gauges.items():
+            result[f"f1_{name}"] = value
+        for name, values in store.histograms.items():
+            if values:
+                ordered = sorted(values)
+                result[f"f1_{name}_p95"] = ordered[int((len(ordered) - 1) * 0.95)]
+        return result
+
     def model_performance(self) -> list[dict]:
         summaries = []
         for (backend, artifact_id), samples in sorted(self._model_evaluations.items()):

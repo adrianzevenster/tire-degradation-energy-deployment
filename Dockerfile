@@ -15,6 +15,7 @@ ENV F1_BUILD_SHA=${F1_BUILD_SHA} \
 WORKDIR /app
 COPY pyproject.toml README.md ./
 COPY src ./src
+COPY examples ./examples
 
 RUN apt-get update && apt-get install -y --no-install-recommends libgomp1 && rm -rf /var/lib/apt/lists/*
 

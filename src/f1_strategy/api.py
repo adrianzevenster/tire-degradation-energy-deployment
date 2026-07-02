@@ -781,8 +781,12 @@ try:
     def replay_evaluation(dataset_path: str = str(DEFAULT_REPLAY_DATASET)) -> dict:
         try:
             report = run_replay_evaluation(_safe_dataset_path(dataset_path), engine=engine)
-        except Exception as exc:
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=str(exc)) from exc
+        except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except Exception as exc:
+            raise HTTPException(status_code=500, detail=str(exc)) from exc
         return replay_report_to_dict(report)
 
     @app.get("/data-sources/replay-datasets")

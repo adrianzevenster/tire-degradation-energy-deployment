@@ -494,7 +494,7 @@ async function refreshOps() {
         metricsResult,
       ]
         .filter((result) => result.status === "rejected")
-        .map((result) => `${result.label}: ${result.reason?.message || String(result.reason)}`);
+        .map((result) => `${result.label}: ${result.reason?.detail || result.reason?.message || String(result.reason)}`);
       setNotice(`Evaluation view loaded with partial data: ${failures[0]}`, "error");
     }
     renderOps();

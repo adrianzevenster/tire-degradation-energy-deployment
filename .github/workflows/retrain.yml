@@ -50,9 +50,28 @@ jobs:
           pip install dvc dvc-s3
           pip install -e ".[ml]"
 
+      # Preflight: check whether we have what we need to actually retrain.
+      # Sets skip=true when no DVC_REMOTE_URL secret AND no local data/ CSVs
+      # (the checkout never contains data/ — it's DVC-tracked, not committed).
+      # All subsequent steps are gated on skip != 'true' so the job exits
+      # cleanly instead of failing the weekly cron with a hard error.
+      - name: Preflight — check data availability
+        id: preflight
+        env:
+          DVC_REMOTE_URL: ${{ secrets.DVC_REMOTE_URL }}
+        run: |
+          if [ -z "$DVC_REMOTE_URL" ] && { [ ! -d data ] || [ -z "$(ls data/fastf1-*.csv 2>/dev/null)" ]; }; then
+            echo "WARNING: No DVC_REMOTE_URL secret configured and no data/ directory found."
+            echo "Skipping retrain. To enable retraining, add DVC_REMOTE_URL as a GitHub repo secret"
+            echo "pointing at an S3/GCS bucket that holds the DVC-tracked data."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
       # Override params from workflow_dispatch inputs when manually triggered
       - name: Override params from inputs
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && steps.preflight.outputs.skip != 'true'
         run: |
           python - <<'EOF'
           import yaml, sys
@@ -68,8 +87,8 @@ jobs:
 
       # Configure DVC remote.  Set DVC_REMOTE_URL in repo secrets to point at
       # an S3 bucket (s3://bucket/prefix) or GCS (gs://bucket/prefix).
-      # Falls back to a local path if the secret is not set (no data pull).
       - name: Configure DVC remote
+        if: steps.preflight.outputs.skip != 'true'
         env:
           DVC_REMOTE_URL: ${{ secrets.DVC_REMOTE_URL }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -83,6 +102,7 @@ jobs:
           fi
 
       - name: Pull training data from DVC remote
+        if: steps.preflight.outputs.skip != 'true'
         env:
           DVC_REMOTE_URL: ${{ secrets.DVC_REMOTE_URL }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -91,31 +111,30 @@ jobs:
           if [ -n "$DVC_REMOTE_URL" ]; then
             dvc pull data.dvc
           else
-            echo "Skipping dvc pull (no remote configured)"
-            # Verify data is present some other way
-            if [ ! -d data ] || [ -z "$(ls data/fastf1-*.csv 2>/dev/null)" ]; then
-              echo "ERROR: data/ directory is missing and no DVC remote is configured."
-              echo "Either set DVC_REMOTE_URL as a repository secret, or push data manually."
-              exit 1
-            fi
+            echo "Using local data/ (no remote configured)"
           fi
 
       - name: Reproduce pipeline (skip if nothing changed)
+        if: steps.preflight.outputs.skip != 'true'
         run: dvc repro --pull
 
       - name: Show pipeline metrics
+        if: steps.preflight.outputs.skip != 'true'
         run: dvc metrics show || true
 
       - name: Show changed metrics vs previous run
+        if: steps.preflight.outputs.skip != 'true'
         run: dvc metrics diff || true
 
       - name: Promote latest candidate artifact
+        if: steps.preflight.outputs.skip != 'true'
         run: |
           python -m f1_strategy.artifacts promote-latest \
             --backend ${{ inputs.backend || 'xgboost' }} \
             --artifact-root artifacts/models
 
       - name: Push model outputs to DVC remote
+        if: steps.preflight.outputs.skip != 'true'
         env:
           DVC_REMOTE_URL: ${{ secrets.DVC_REMOTE_URL }}
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -126,6 +145,7 @@ jobs:
           fi
 
       - name: Commit dvc.lock, registry, and model back to repo
+        if: steps.preflight.outputs.skip != 'true'
         run: |
           git config user.name  "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
